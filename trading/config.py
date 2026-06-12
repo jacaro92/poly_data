@@ -83,8 +83,13 @@ MAX_HOLD_HOURS = float(os.environ.get("MAX_HOLD_HOURS", "72"))
 # Cadencia del loop de la estrategia (segundos).
 STRATEGY_POLL_SECONDS = int(os.environ.get("STRATEGY_POLL_SECONDS", "30"))
 
-# Puerto del dashboard web (trading/dashboard.py).
-DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8050"))
+# Puerto del dashboard web (trading/dashboard.py). Railway inyecta PORT al
+# generar un dominio público; tiene prioridad sobre DASHBOARD_PORT.
+DASHBOARD_PORT = int(os.environ.get("PORT", os.environ.get("DASHBOARD_PORT", "8050")))
+
+# Contraseña del dashboard (HTTP Basic Auth, usuario "admin"). OBLIGATORIA
+# si el dashboard es público en internet; vacía = sin auth (solo local).
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
 
 
 def compute_size(balance_usdc: float) -> float:

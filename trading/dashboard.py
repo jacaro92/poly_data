@@ -10,6 +10,7 @@ Sin dependencias nuevas: http.server de la stdlib + requests (ya instalado).
 Uso: python -m trading.dashboard   (servicio poly-dashboard en docker-compose)
 """
 
+import base64
 import csv
 import json
 import os
@@ -242,7 +243,21 @@ refresh(); setInterval(refresh,15000);
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _authorized(self) -> bool:
+        """HTTP Basic Auth (usuario 'admin') si DASHBOARD_PASSWORD está fijada."""
+        if not config.DASHBOARD_PASSWORD:
+            return True
+        expected = base64.b64encode(
+            f"admin:{config.DASHBOARD_PASSWORD}".encode()
+        ).decode()
+        return self.headers.get("Authorization", "") == f"Basic {expected}"
+
     def do_GET(self):
+        if not self._authorized():
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="poly-trader"')
+            self.end_headers()
+            return
         if self.path.startswith("/api/state"):
             body = json.dumps(build_state()).encode()
             ctype = "application/json"
