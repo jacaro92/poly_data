@@ -208,6 +208,10 @@ def _fetch_logs(w3, start: int, end: int):
             )
         except Exception as e:
             msg = str(e).lower()
+            # Log the full error body so 400/500 responses are debuggable
+            err_body = getattr(getattr(e, "response", None), "text", "")[:300]
+            if err_body:
+                print(f"  ! RPC error body: {err_body}")
             if "pruned" in msg and pruned_attempt < PRUNED_MAX_RETRIES:
                 delay = min(2 ** pruned_attempt, 30)
                 print(
@@ -219,13 +223,18 @@ def _fetch_logs(w3, start: int, end: int):
                 continue
             range_err = any(
                 s in msg
-                for s in ("range", "too many", "limit", "result", "413", "too large", "entity too large")
+                for s in (
+                    "range", "too many", "limit", "result",
+                    "413", "too large", "entity too large",
+                    "400", "bad request", "query returned more",
+                )
             )
             if range_err:
                 raise RuntimeError(
                     f"RPC rejected blocks {start}-{end} ({end - start + 1} blocks): {e}\n"
-                    f"        POLYGON_MAX_BLOCK_RANGE={BLOCK_RANGE} is too high for this RPC — "
-                    f"lower it and re-run (it resumes from the saved cursor)."
+                    f"        POLYGON_MAX_BLOCK_RANGE={BLOCK_RANGE} may be too high for this RPC — "
+                    f"lower it and re-run (it resumes from the saved cursor).\n"
+                    f"        RPC error body: {err_body}"
                 ) from e
             raise
 

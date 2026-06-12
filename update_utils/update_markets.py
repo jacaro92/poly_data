@@ -84,13 +84,40 @@ def _market_to_row(market: dict, columns: List[str]) -> list:
     return [_flatten_value(market.get(col)) for col in columns]
 
 
+# Only the columns needed for trade processing + analysis. Storing the full API
+# response (~50 fields with long text) bloats markets.csv by 10x without value.
+# The processor (get_lean_markets) only reads id + clobTokenIds; the rest is for
+# human-readable analysis. Add to this list if you need more fields.
+MARKETS_KEEP_COLUMNS = [
+    "id",
+    "question",
+    "conditionId",
+    "slug",
+    "endDateIso",
+    "clobTokenIds",
+    "active",
+    "closed",
+    "volume",
+    "liquidityMin",
+]
+
+
+def _filter_columns(all_cols: List[str]) -> List[str]:
+    """Return the intersection of MARKETS_KEEP_COLUMNS with what the API returned."""
+    keep = [c for c in MARKETS_KEEP_COLUMNS if c in all_cols]
+    # Always include 'id' — required for dedup
+    if "id" not in keep and "id" in all_cols:
+        keep.insert(0, "id")
+    return keep
+
+
 def _fetch_markets_keyset(
     params_extra: dict, batch_size: int, csv_file: str, state_file: str
 ) -> int:
     """
     Fetch markets using the keyset pagination endpoint.
-    Writes ALL fields returned by the API into the CSV.
-    Column order is determined by the first batch and stored in state
+    Writes only MARKETS_KEEP_COLUMNS (not the full API response) to keep the
+    CSV small. Column order is determined by the first batch and stored in state
     so that resumed runs stay consistent.
     """
     base_url = "https://gamma-api.polymarket.com/markets/keyset"
@@ -150,9 +177,9 @@ def _fetch_markets_keyset(
                 if not markets:
                     break
 
-                # Discover columns from the first batch
+                # Discover columns from the first batch (filtered to MARKETS_KEEP_COLUMNS)
                 if columns is None:
-                    columns = list(markets[0].keys())
+                    columns = _filter_columns(list(markets[0].keys()))
                     writer.writerow(columns)
 
                 batch_count = 0

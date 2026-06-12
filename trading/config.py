@@ -36,6 +36,32 @@ SIGNATURE_TYPE = int(os.environ.get("SIGNATURE_TYPE", "2"))
 # Gate de ejecución real. false => solo lectura/simulación.
 AUTO_EXECUTE = os.environ.get("AUTO_EXECUTE", "false").lower() == "true"
 
+# ── Telegram notifications ──────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ── Sizing por trade ────────────────────────────────────────────────────────
+# TRADE_SIZE_PCT > 0 tiene prioridad sobre TRADE_SIZE_USD.
+# Ejemplo: 0.10 = 10% del balance disponible por trade.
+TRADE_SIZE_USD = float(os.environ.get("TRADE_SIZE_USD", "5.0"))
+TRADE_SIZE_PCT = float(os.environ.get("TRADE_SIZE_PCT", "0.0"))
+
+# ── Gestión de riesgo ───────────────────────────────────────────────────────
+# 0.0 = deshabilitado. Valores en fracción del valor del token desde entrada.
+# Ejemplo: STOP_LOSS_PCT=0.30 → cierra si el token pierde 30% desde entrada.
+# Ejemplo: TAKE_PROFIT_PCT=0.40 → cierra si el token sube 40% desde entrada.
+# NOTA: Polymarket no tiene SL/TP nativos; requiere un loop de monitoreo
+# que llame a executor.check_sl_tp() y ejecute la venta si se dispara.
+STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "0.0"))
+TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "0.0"))
+
+
+def compute_size(balance_usdc: float) -> float:
+    """Devuelve el tamaño a invertir en USD según la configuración."""
+    if TRADE_SIZE_PCT > 0:
+        return round(balance_usdc * TRADE_SIZE_PCT, 2)
+    return TRADE_SIZE_USD
+
 
 def assert_ready_for_live() -> None:
     """Falla con un mensaje claro si falta algo para operar en real."""
