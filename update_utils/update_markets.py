@@ -131,6 +131,15 @@ def _fetch_markets_keyset(
     columns = state.get("columns")
     resuming = cursor is not None
 
+    # State inválido → empezar de cero: CSV borrado a mano, o columnas de un
+    # formato anterior (lista completa de la API en vez de MARKETS_KEEP_COLUMNS).
+    if resuming and (
+        not os.path.exists(csv_file)
+        or (columns and columns != _filter_columns(columns))
+    ):
+        print("  State incompatible (CSV borrado o columnas viejas) — reinicio desde cero")
+        cursor, fetched, columns, resuming = None, 0, None, False
+
     if resuming:
         print(f"  Resuming from cursor, fetched so far={fetched}")
         seen_ids = _load_seen_ids(csv_file, columns or [])
