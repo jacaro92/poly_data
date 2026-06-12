@@ -12,6 +12,12 @@ if [ ! -L /app/processed ]; then
     ln -s /app/data/processed /app/processed
 fi
 
+# Con argumentos (command: en docker-compose) ejecuta eso en lugar del loop
+# de datos — lo usan los servicios poly-trader y poly-dashboard.
+if [ "$#" -gt 0 ]; then
+    exec "$@"
+fi
+
 while true; do
     echo "[entrypoint] $(date -u '+%Y-%m-%d %H:%M:%S') — ejecutando update.py"
     python update.py || echo "[entrypoint] update.py falló; se reintenta en el próximo ciclo"

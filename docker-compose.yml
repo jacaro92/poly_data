@@ -17,3 +17,42 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Copy-trader: sigue wallets rentables y abre/cierra posiciones.
+  # Con AUTO_EXECUTE=false opera en paper trading (posiciones simuladas).
+  poly-trader:
+    build: .
+    container_name: poly-trader
+    env_file: .env
+    command: ["python", "-m", "trading.strategy"]
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Dashboard de seguimiento: http://localhost:8050
+  poly-dashboard:
+    build: .
+    container_name: poly-dashboard
+    env_file: .env
+    command: ["python", "-m", "trading.dashboard"]
+    ports:
+      - "8050:8050"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

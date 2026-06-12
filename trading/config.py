@@ -55,6 +55,37 @@ TRADE_SIZE_PCT = float(os.environ.get("TRADE_SIZE_PCT", "0.0"))
 STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "0.0"))
 TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "0.0"))
 
+# ── Estrategia copy-trading (trading/strategy.py) ───────────────────────────
+# Wallets a seguir, separadas por comas. Si está vacío se leen las top
+# COPY_TOP_N de processed/top_wallets.csv (generado por wallet_analyzer).
+COPY_WALLETS = [
+    w.strip().lower()
+    for w in os.environ.get("COPY_WALLETS", "").split(",")
+    if w.strip()
+]
+COPY_TOP_N = int(os.environ.get("COPY_TOP_N", "5"))
+
+# Solo se copian trades del wallet seguido con tamaño >= este umbral (USD).
+# Filtra el ruido de micro-trades y rebalanceos.
+MIN_COPY_TRADE_USD = float(os.environ.get("MIN_COPY_TRADE_USD", "50.0"))
+
+# Límites de cartera y de entrada.
+MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "3"))
+ENTRY_PRICE_MIN = float(os.environ.get("ENTRY_PRICE_MIN", "0.10"))
+ENTRY_PRICE_MAX = float(os.environ.get("ENTRY_PRICE_MAX", "0.90"))
+
+# Salidas adicionales a SL/TP:
+#   COPY_EXIT: cerrar cuando el wallet seguido vende el mismo token.
+#   MAX_HOLD_HOURS: cierre por tiempo (0 = sin límite).
+COPY_EXIT = os.environ.get("COPY_EXIT", "true").lower() == "true"
+MAX_HOLD_HOURS = float(os.environ.get("MAX_HOLD_HOURS", "72"))
+
+# Cadencia del loop de la estrategia (segundos).
+STRATEGY_POLL_SECONDS = int(os.environ.get("STRATEGY_POLL_SECONDS", "30"))
+
+# Puerto del dashboard web (trading/dashboard.py).
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8050"))
+
 
 def compute_size(balance_usdc: float) -> float:
     """Devuelve el tamaño a invertir en USD según la configuración."""
