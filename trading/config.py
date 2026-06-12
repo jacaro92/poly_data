@@ -83,6 +83,10 @@ MAX_HOLD_HOURS = float(os.environ.get("MAX_HOLD_HOURS", "72"))
 # Cadencia del loop de la estrategia (segundos).
 STRATEGY_POLL_SECONDS = int(os.environ.get("STRATEGY_POLL_SECONDS", "30"))
 
+# Cada cuántas horas la estrategia regenera processed/top_wallets.csv a partir
+# de trades.csv (0 = nunca; solo aplica si COPY_WALLETS está vacío).
+WALLET_REFRESH_HOURS = float(os.environ.get("WALLET_REFRESH_HOURS", "6"))
+
 # Puerto del dashboard web (trading/dashboard.py). Railway inyecta PORT al
 # generar un dominio público; tiene prioridad sobre DASHBOARD_PORT.
 DASHBOARD_PORT = int(os.environ.get("PORT", os.environ.get("DASHBOARD_PORT", "8050")))

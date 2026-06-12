@@ -44,6 +44,7 @@ from trading.wallet_utils import proxy_balance
 
 DATA_API = "https://data-api.polymarket.com"
 TOP_WALLETS_CSV = os.path.join("processed", "top_wallets.csv")
+TRADES_CSV = os.path.join("processed", "trades.csv")
 
 # Precio extremo = mercado decidido de facto.
 RESOLVED_HI = 0.99
@@ -108,6 +109,27 @@ class CopyTrader:
             self.executor = PolymarketExecutor()
         self.state = positions.load_state()
         self._balance_cache: tuple[float, float] = (0.0, 0.0)  # (ts, total)
+        self._last_analyze = 0.0
+
+    def maybe_refresh_wallets(self) -> None:
+        """Regenera el ranking de wallets cada WALLET_REFRESH_HOURS cuando hay
+        datos en trades.csv. Así el sistema se auto-arranca al terminar el
+        backfill sin ejecutar wallet_analyzer a mano."""
+        if config.COPY_WALLETS or config.WALLET_REFRESH_HOURS <= 0:
+            return
+        if time.time() - self._last_analyze < config.WALLET_REFRESH_HOURS * 3600:
+            return
+        if not os.path.isfile(TRADES_CSV) or os.path.getsize(TRADES_CSV) < 10_000:
+            return  # aún sin datos suficientes; se reintenta el próximo ciclo
+        self._last_analyze = time.time()
+        try:
+            from trading.wallet_analyzer import analyze
+            ranking = analyze()
+            print(f"  📊 ranking actualizado: {len(ranking)} wallets")
+        except SystemExit as e:
+            print(f"  analyzer: {e}")
+        except Exception as e:
+            print(f"  ! analyzer falló: {e}")
 
     # ── helpers ──
 
@@ -254,10 +276,10 @@ class CopyTrader:
     # ── ciclo principal ──
 
     def cycle(self) -> None:
+        self.maybe_refresh_wallets()
         wallets = followed_wallets()
         if not wallets:
-            print("  (sin wallets a seguir — ejecuta wallet_analyzer o fija COPY_WALLETS)")
-            return
+            return  # sin ranking aún (backfill en curso); se reintenta
 
         sells_by_token: dict[str, str] = {}
         for wallet in wallets:

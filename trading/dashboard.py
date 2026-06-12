@@ -70,6 +70,37 @@ def _top_wallets(n: int = 10) -> list[dict]:
         return list(csv.DictReader(f))[:n]
 
 
+# Génesis del CTF Exchange V2 y bloque aproximado donde empiezan los
+# OrderFilled (migración de v1, ~2026-04-28). Antes de eso el scan da 0 eventos.
+V2_GENESIS_BLOCK = 84_902_353
+EVENTS_FROM_BLOCK = 86_100_000
+
+
+def _network_latest_block() -> int | None:
+    def fetch():
+        rpc = os.environ.get("POLYGON_RPC_URL", "https://polygon.drpc.org")
+        resp = _session.post(
+            rpc,
+            json={"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return int(resp.json()["result"], 16)
+
+    return _cached("network_latest", 60, fetch)
+
+
+def _markets_fetched() -> int:
+    total = 0
+    for part in ("closed", "active"):
+        try:
+            with open(os.path.join("data", f"markets_{part}_state.json")) as f:
+                total += json.load(f).get("fetched", 0) or 0
+        except Exception:
+            pass
+    return total
+
+
 def _pipeline_status() -> dict:
     status: dict = {}
     try:
@@ -77,6 +108,19 @@ def _pipeline_status() -> dict:
             status["chain_last_block"] = json.load(f).get("last_block")
     except Exception:
         status["chain_last_block"] = None
+
+    latest = _network_latest_block()
+    status["network_latest_block"] = latest
+    cursor = status["chain_last_block"]
+    if cursor and latest and latest > V2_GENESIS_BLOCK:
+        status["chain_progress"] = round(
+            min((cursor - V2_GENESIS_BLOCK) / (latest - V2_GENESIS_BLOCK), 1.0), 4
+        )
+    else:
+        status["chain_progress"] = None
+    status["events_from_block"] = EVENTS_FROM_BLOCK
+    status["markets_fetched"] = _markets_fetched()
+
     for name, path in (("orderfilled_mb", ORDERS_CSV), ("trades_mb", TRADES_CSV)):
         try:
             status[name] = round(os.path.getsize(path) / 1e6, 1)
@@ -231,12 +275,18 @@ async function refresh(){
     {h:"Acción",f:r=>esc(r.action),c:r=>r.action==="COPIED"?"pos":""},
   ]);
   const p=s.pipeline;
+  const prog=p.chain_progress!=null?(p.chain_progress*100).toFixed(1)+"%":"—";
+  const preEvents=p.chain_last_block&&p.chain_last_block<p.events_from_block;
   document.getElementById("pipeline").innerHTML=
     `<div class="cards">
-      <div class="card"><div class="label">Último bloque</div><div class="value">${p.chain_last_block?p.chain_last_block.toLocaleString():"—"}</div></div>
+      <div class="card"><div class="label">Backfill</div><div class="value">${prog}</div></div>
+      <div class="card"><div class="label">Bloque escaneado</div><div class="value">${p.chain_last_block?p.chain_last_block.toLocaleString():"—"}</div></div>
+      <div class="card"><div class="label">Bloque red</div><div class="value">${p.network_latest_block?p.network_latest_block.toLocaleString():"—"}</div></div>
+      <div class="card"><div class="label">Markets</div><div class="value">${p.markets_fetched.toLocaleString()}</div></div>
       <div class="card"><div class="label">orderFilled.csv</div><div class="value">${p.orderfilled_mb} MB</div></div>
       <div class="card"><div class="label">trades.csv</div><div class="value">${p.trades_mb} MB</div></div>
-    </div>`;
+    </div>`+
+    (preEvents?`<div class="sub" style="margin-top:8px">ℹ️ Los eventos OrderFilled empiezan en el bloque ~${p.events_from_block.toLocaleString()} (28-abr-2026). Hasta que el scan llegue ahí, trades/wallets/señales estarán vacíos — es lo esperado.</div>`:"");
 }
 refresh(); setInterval(refresh,15000);
 </script></body></html>"""
