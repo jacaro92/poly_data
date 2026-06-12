@@ -18,8 +18,6 @@ siempre; las que envían órdenes exigen AUTO_EXECUTE=true.
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
-    AssetType,
-    BalanceAllowanceParams,
     MarketOrderArgs,
     OrderArgs,
     OrderType,
@@ -55,9 +53,8 @@ class PolymarketExecutor:
         return self.client.get_address()
 
     def usdc_balance(self) -> dict:
-        return self.client.get_balance_allowance(
-            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-        )
+        from trading.wallet_utils import proxy_balance
+        return proxy_balance(config.FUNDER_ADDRESS)
 
     def midpoint(self, token_id: str) -> dict:
         return self.client.get_midpoint(token_id)
