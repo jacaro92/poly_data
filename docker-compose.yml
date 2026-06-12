@@ -1,0 +1,19 @@
+services:
+  poly-data:
+    build: .
+    container_name: poly-data
+    env_file: .env
+    # El DNS de la red local (router Starlink) devuelve una IP secuestrada para
+    # *.polymarket.com — DNS públicos evitan el bloqueo.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    volumes:
+      # Único volumen: CSVs, cursores de resume y processed/ (via symlink)
+      - ./data:/app/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

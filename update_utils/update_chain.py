@@ -63,6 +63,11 @@ RATE_LIMIT_BACKOFF_MAX = 60.0
 # Transient connection failures on startup get a few retries before we give up
 # with a clear message (vs. a wrong URL / dead endpoint, which shouldn't hang).
 CONNECT_MAX_RETRIES = 5
+# Load-balanced public RPCs (e.g. 1rpc.io) mix full-history and pruned backends:
+# the same request can fail with "history has been pruned" and succeed on the
+# next attempt. Retry a bounded number of times before giving up, so a provider
+# that is *only* pruned (publicnode) still fails fast with the real error.
+PRUNED_MAX_RETRIES = 12
 
 COLUMNS = [
     "timestamp",
@@ -183,34 +188,46 @@ def _connect(w3, rpc: str) -> int:
 
 
 def _fetch_logs(w3, start: int, end: int):
-    """Fetch OrderFilled logs for [start, end]. Retries forever on 429.
+    """Fetch OrderFilled logs for [start, end]. Retries forever on 429 and a
+    bounded number of times on pruned-history errors (load-balanced backends).
     If the RPC rejects the block range/response size, stop with guidance to
     lower POLYGON_MAX_BLOCK_RANGE rather than silently shrinking."""
-    try:
-        return _call_with_rate_retry(
-            lambda: w3.eth.get_logs(
-                {
-                    "fromBlock": start,
-                    "toBlock": end,
-                    "address": CTF_EXCHANGE_V2,
-                    "topics": [ORDERFILLED_TOPIC],
-                }
-            ),
-            f"get_logs {start}-{end}",
-        )
-    except Exception as e:
-        msg = str(e).lower()
-        range_err = any(
-            s in msg
-            for s in ("range", "too many", "limit", "result", "413", "too large", "entity too large")
-        )
-        if range_err:
-            raise RuntimeError(
-                f"RPC rejected blocks {start}-{end} ({end - start + 1} blocks): {e}\n"
-                f"        POLYGON_MAX_BLOCK_RANGE={BLOCK_RANGE} is too high for this RPC — "
-                f"lower it and re-run (it resumes from the saved cursor)."
-            ) from e
-        raise
+    pruned_attempt = 0
+    while True:
+        try:
+            return _call_with_rate_retry(
+                lambda: w3.eth.get_logs(
+                    {
+                        "fromBlock": start,
+                        "toBlock": end,
+                        "address": CTF_EXCHANGE_V2,
+                        "topics": [ORDERFILLED_TOPIC],
+                    }
+                ),
+                f"get_logs {start}-{end}",
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            if "pruned" in msg and pruned_attempt < PRUNED_MAX_RETRIES:
+                delay = min(2 ** pruned_attempt, 30)
+                print(
+                    f"  ! pruned-history backend on get_logs {start}-{end}; "
+                    f"retrying in {delay:.0f}s ({pruned_attempt + 1}/{PRUNED_MAX_RETRIES})"
+                )
+                time.sleep(delay)
+                pruned_attempt += 1
+                continue
+            range_err = any(
+                s in msg
+                for s in ("range", "too many", "limit", "result", "413", "too large", "entity too large")
+            )
+            if range_err:
+                raise RuntimeError(
+                    f"RPC rejected blocks {start}-{end} ({end - start + 1} blocks): {e}\n"
+                    f"        POLYGON_MAX_BLOCK_RANGE={BLOCK_RANGE} is too high for this RPC — "
+                    f"lower it and re-run (it resumes from the saved cursor)."
+                ) from e
+            raise
 
 
 def update_chain() -> None:

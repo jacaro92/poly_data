@@ -23,13 +23,16 @@ dev = [
     "notebook>=7.0.0",
     "ipykernel>=6.25.0",
 ]
+trading = [
+    "py-clob-client>=0.17.0",
+]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["poly_utils", "update_utils"]
+packages = ["poly_utils", "update_utils", "trading"]
 
 [tool.uv]
 dev-dependencies = []
