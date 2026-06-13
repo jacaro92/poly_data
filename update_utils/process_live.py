@@ -20,7 +20,11 @@ warnings.filterwarnings("ignore")
 
 import polars as pl
 
-from poly_utils.utils import get_lean_markets, update_missing_tokens
+from poly_utils.utils import (
+    MARKETS_LEAN_PARQUET,
+    build_lean_markets_parquet,
+    update_missing_tokens,
+)
 
 FILLS_DIR = "data/fills"
 TRADES_DIR = "processed/trades"
@@ -75,34 +79,43 @@ def _cleanup_old_trades() -> None:
         print(f"  [cleanup] Removed {removed} old trade file(s)")
 
 
-def _discover_missing_tokens(markets_df: pl.DataFrame, fill_files: list[str]) -> bool:
-    """Return True if new missing tokens were fetched (Parquet cache is now stale)."""
-    if not fill_files:
-        return False
-    # .unique() before .collect() avoids materialising 65M+ rows into RAM.
-    df = (
-        pl.scan_parquet(fill_files)
-        .select(["makerAssetId", "takerAssetId"])
-        .unique()
+def _collect_unique_tokens(fill_files: list[str]) -> set[str]:
+    """Collect unique non-USDC token IDs by reading fill files one at a time.
+
+    Peak RAM: O(unique tokens) ≈ 10 MB, regardless of how many fill files exist.
+    Never materialises the full fills dataset.
+    """
+    tokens: set[str] = set()
+    for fpath in fill_files:
+        try:
+            df = pl.read_parquet(fpath, columns=["makerAssetId", "takerAssetId"])
+            tokens.update(v for v in df["makerAssetId"].drop_nulls().to_list() if v != "0")
+            tokens.update(v for v in df["takerAssetId"].drop_nulls().to_list() if v != "0")
+        except Exception:
+            pass
+    return tokens
+
+
+def _get_markets_for_tokens(token_ids: set[str]) -> pl.DataFrame:
+    """Load only markets whose tokens appear in token_ids.
+
+    Scans markets_lean.parquet one row-group at a time and filters immediately,
+    so peak RAM is ~one row-group (~88 MB) instead of the full ~250 MB for all
+    1.38 M markets.  Returns a small DataFrame (only matched markets).
+    """
+    empty = pl.DataFrame(schema={"id": pl.Utf8, "token1": pl.Utf8, "token2": pl.Utf8})
+    if not token_ids:
+        return empty
+    if not os.path.exists(MARKETS_LEAN_PARQUET):
+        raise FileNotFoundError(f"{MARKETS_LEAN_PARQUET} not found — run update_markets() first")
+    token_list = list(token_ids)
+    return (
+        pl.scan_parquet(MARKETS_LEAN_PARQUET)
+        .filter(
+            pl.col("token1").is_in(token_list) | pl.col("token2").is_in(token_list)
+        )
         .collect()
     )
-    trade_asset_ids = (
-        set(df["makerAssetId"].drop_nulls().to_list())
-        | set(df["takerAssetId"].drop_nulls().to_list())
-    ) - {"0"}
-
-    existing: set = set()
-    for col in ("token1", "token2"):
-        if col in markets_df.columns:
-            existing.update(markets_df[col].drop_nulls().to_list())
-
-    missing = sorted(trade_asset_ids - existing)
-    if missing:
-        print(f"🔍 {len(missing)} markets not in markets.csv — fetching from Polymarket API")
-        update_missing_tokens(missing)
-        return True
-    print("✅ All markets present")
-    return False
 
 
 # ── core join ─────────────────────────────────────────────────────────────────
@@ -231,11 +244,28 @@ def process_live() -> None:
 
     print(f"📍 Processing {len(new_files)} new fill file(s) (cursor: {cursor_fname or 'none'})")
 
-    markets_df = get_lean_markets()  # fast: loads ~20 MB Parquet built by update_markets
-    if _discover_missing_tokens(markets_df, new_files):
-        # missing_markets.csv was updated → Parquet cache is stale → reload
-        del markets_df
-        markets_df = get_lean_markets()
+    # Collect unique token IDs (one file at a time: ~10 MB peak regardless of fill count)
+    print("  Collecting token IDs from fill files...")
+    all_token_ids = _collect_unique_tokens(new_files)
+    print(f"  {len(all_token_ids):,} unique token IDs found")
+
+    # Load only matching markets (filtered scan: peak ~100 MB instead of ~250 MB)
+    markets_df = _get_markets_for_tokens(all_token_ids)
+    print(f"  {len(markets_df):,} relevant markets loaded")
+
+    # Detect and fetch any missing markets (cheap: compares small in-memory sets)
+    existing_tokens: set[str] = set()
+    for _col in ("token1", "token2"):
+        if _col in markets_df.columns:
+            existing_tokens.update(markets_df[_col].drop_nulls().to_list())
+    missing = sorted(all_token_ids - existing_tokens)
+    if missing:
+        print(f"🔍 {len(missing)} missing markets — fetching from Polymarket API")
+        update_missing_tokens(missing)
+        build_lean_markets_parquet()
+        markets_df = _get_markets_for_tokens(all_token_ids)
+    else:
+        print("✅ All markets present")
 
     os.makedirs(TRADES_DIR, exist_ok=True)
     _cleanup_old_trades()
