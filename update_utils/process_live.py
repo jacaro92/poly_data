@@ -75,13 +75,14 @@ def _cleanup_old_trades() -> None:
         print(f"  [cleanup] Removed {removed} old trade file(s)")
 
 
-def _discover_missing_tokens(markets_df: pl.DataFrame) -> None:
-    fill_files = _list_fill_files()
+def _discover_missing_tokens(markets_df: pl.DataFrame, fill_files: list[str]) -> None:
     if not fill_files:
         return
+    # .unique() before .collect() avoids materialising 65M+ rows into RAM.
     df = (
         pl.scan_parquet(fill_files)
         .select(["makerAssetId", "takerAssetId"])
+        .unique()
         .collect()
     )
     trade_asset_ids = (
@@ -229,7 +230,7 @@ def process_live() -> None:
     print(f"📍 Processing {len(new_files)} new fill file(s) (cursor: {cursor_fname or 'none'})")
 
     markets_df = get_lean_markets()
-    _discover_missing_tokens(markets_df)
+    _discover_missing_tokens(markets_df, new_files)
     markets_df = get_lean_markets()
 
     os.makedirs(TRADES_DIR, exist_ok=True)
@@ -257,13 +258,11 @@ def process_live() -> None:
         trades_chunk.write_parquet(trades_file, compression="zstd")
         total_new_trades += len(trades_chunk)
         last_processed_fname = os.path.basename(paths[-1])
+        _save_fill_cursor(last_processed_fname)  # incremental — survives OOM kills
         print(
             f"  {date_str}: {len(fills_chunk):,} new fills "
             f"→ {trades_file} ({len(trades_chunk):,} trades total)"
         )
-
-    if last_processed_fname:
-        _save_fill_cursor(last_processed_fname)
 
     print(f"✓ Done. Processed {len(new_files)} fill file(s), {total_new_trades:,} trade rows.")
     print("=" * 60)
