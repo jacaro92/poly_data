@@ -314,7 +314,7 @@ def update_chain() -> None:
 
         cur = end + 1
         _save_cursor(cur)
-        time.sleep(0.05)
+        time.sleep(2.0)
 
     print(f"Done. Wrote {total_new:,} new rows to {FILLS_DIR}/.")
 
