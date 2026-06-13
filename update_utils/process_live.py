@@ -75,9 +75,10 @@ def _cleanup_old_trades() -> None:
         print(f"  [cleanup] Removed {removed} old trade file(s)")
 
 
-def _discover_missing_tokens(markets_df: pl.DataFrame, fill_files: list[str]) -> None:
+def _discover_missing_tokens(markets_df: pl.DataFrame, fill_files: list[str]) -> bool:
+    """Return True if new missing tokens were fetched (Parquet cache is now stale)."""
     if not fill_files:
-        return
+        return False
     # .unique() before .collect() avoids materialising 65M+ rows into RAM.
     df = (
         pl.scan_parquet(fill_files)
@@ -99,8 +100,9 @@ def _discover_missing_tokens(markets_df: pl.DataFrame, fill_files: list[str]) ->
     if missing:
         print(f"🔍 {len(missing)} markets not in markets.csv — fetching from Polymarket API")
         update_missing_tokens(missing)
-    else:
-        print("✅ All markets present")
+        return True
+    print("✅ All markets present")
+    return False
 
 
 # ── core join ─────────────────────────────────────────────────────────────────
@@ -229,9 +231,11 @@ def process_live() -> None:
 
     print(f"📍 Processing {len(new_files)} new fill file(s) (cursor: {cursor_fname or 'none'})")
 
-    markets_df = get_lean_markets()
-    _discover_missing_tokens(markets_df, new_files)
-    markets_df = get_lean_markets()
+    markets_df = get_lean_markets()  # fast: loads ~20 MB Parquet built by update_markets
+    if _discover_missing_tokens(markets_df, new_files):
+        # missing_markets.csv was updated → Parquet cache is stale → reload
+        del markets_df
+        markets_df = get_lean_markets()
 
     os.makedirs(TRADES_DIR, exist_ok=True)
     _cleanup_old_trades()

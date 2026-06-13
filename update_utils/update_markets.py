@@ -269,6 +269,15 @@ def update_markets(csv_filename: str = "data/markets.csv", batch_size: int = 500
     total = closed_count + active_count
     print(f"Total markets: {total}")
     print(f"Data saved to: {csv_filename}")
+
+    # Pre-build the lean Parquet now (while this thread has memory budget)
+    # so process_live can load ~20 MB instead of rebuilding from the full CSV.
+    try:
+        from poly_utils.utils import build_lean_markets_parquet
+        build_lean_markets_parquet()
+    except Exception as e:
+        print(f"  [markets] Warning: lean Parquet build failed: {e}")
+
     # Part files + state files are preserved across runs so subsequent calls
     # can resume incrementally from the saved cursors. markets.csv is
     # regenerated each run by merging the (growing) part files.
