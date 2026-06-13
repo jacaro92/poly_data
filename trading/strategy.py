@@ -44,7 +44,7 @@ from trading.wallet_utils import proxy_balance
 
 DATA_API = "https://data-api.polymarket.com"
 TOP_WALLETS_CSV = os.path.join("processed", "top_wallets.csv")
-TRADES_CSV = os.path.join("processed", "trades.csv")
+TRADES_DIR = os.path.join("processed", "trades")
 
 # Precio extremo = mercado decidido de facto.
 RESOLVED_HI = 0.99
@@ -119,7 +119,9 @@ class CopyTrader:
             return
         if time.time() - self._last_analyze < config.WALLET_REFRESH_HOURS * 3600:
             return
-        if not os.path.isfile(TRADES_CSV) or os.path.getsize(TRADES_CSV) < 10_000:
+        if not os.path.isdir(TRADES_DIR) or not any(
+            f.endswith(".parquet") for f in os.listdir(TRADES_DIR)
+        ):
             return  # aún sin datos suficientes; se reintenta el próximo ciclo
         self._last_analyze = time.time()
         try:

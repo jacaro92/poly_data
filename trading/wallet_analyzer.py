@@ -24,7 +24,7 @@ import polars as pl
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-TRADES_CSV = os.path.join("processed", "trades.csv")
+TRADES_DIR = os.path.join("processed", "trades")
 OUTPUT_CSV = os.path.join("processed", "top_wallets.csv")
 
 
@@ -49,16 +49,19 @@ def _wallet_actions(trades: pl.DataFrame) -> pl.DataFrame:
 
 
 def analyze(min_trades: int = 10, min_volume: float = 100.0) -> pl.DataFrame:
-    if not os.path.isfile(TRADES_CSV):
-        raise SystemExit(f"No existe {TRADES_CSV} — espera a que el pipeline lo genere.")
+    trade_files = sorted(
+        os.path.join(TRADES_DIR, f)
+        for f in os.listdir(TRADES_DIR)
+        if f.endswith(".parquet")
+    ) if os.path.isdir(TRADES_DIR) else []
 
-    trades = pl.read_csv(
-        TRADES_CSV,
-        schema_overrides={"price": pl.Float64, "usd_amount": pl.Float64, "token_amount": pl.Float64},
-    ).drop_nulls(subset=["market_id", "nonusdc_side"])
+    if not trade_files:
+        raise SystemExit(f"No existe {TRADES_DIR}/*.parquet — espera a que el pipeline lo genere.")
+
+    trades = pl.read_parquet(trade_files).drop_nulls(subset=["market_id", "nonusdc_side"])
 
     if trades.is_empty():
-        raise SystemExit(f"{TRADES_CSV} está vacío — aún no hay fills procesados.")
+        raise SystemExit(f"{TRADES_DIR}/*.parquet está vacío — aún no hay fills procesados.")
 
     actions = _wallet_actions(trades)
     print(f"Fills: {len(trades):,}  →  acciones de wallet: {len(actions):,}")

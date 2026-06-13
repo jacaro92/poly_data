@@ -27,8 +27,8 @@ from trading.wallet_utils import proxy_balance
 
 TOP_WALLETS_CSV = os.path.join("processed", "top_wallets.csv")
 CURSOR_FILE = os.path.join("data", "cursor_state.json")
-ORDERS_CSV = os.path.join("data", "orderFilled.csv")
-TRADES_CSV = os.path.join("processed", "trades.csv")
+FILLS_DIR = os.path.join("data", "fills")
+TRADES_DIR = os.path.join("processed", "trades")
 
 _session = requests.Session()
 _cache: dict = {}
@@ -121,11 +121,21 @@ def _pipeline_status() -> dict:
     status["events_from_block"] = EVENTS_FROM_BLOCK
     status["markets_fetched"] = _markets_fetched()
 
-    for name, path in (("orderfilled_mb", ORDERS_CSV), ("trades_mb", TRADES_CSV)):
-        try:
-            status[name] = round(os.path.getsize(path) / 1e6, 1)
-        except OSError:
-            status[name] = 0.0
+    def _dir_mb(dirpath: str) -> float:
+        if not os.path.isdir(dirpath):
+            return 0.0
+        return round(
+            sum(
+                os.path.getsize(os.path.join(dirpath, f))
+                for f in os.listdir(dirpath)
+                if f.endswith(".parquet")
+            )
+            / 1e6,
+            1,
+        )
+
+    status["orderfilled_mb"] = _dir_mb(FILLS_DIR)
+    status["trades_mb"] = _dir_mb(TRADES_DIR)
     return status
 
 
@@ -283,8 +293,8 @@ async function refresh(){
       <div class="card"><div class="label">Bloque escaneado</div><div class="value">${p.chain_last_block?p.chain_last_block.toLocaleString():"—"}</div></div>
       <div class="card"><div class="label">Bloque red</div><div class="value">${p.network_latest_block?p.network_latest_block.toLocaleString():"—"}</div></div>
       <div class="card"><div class="label">Markets</div><div class="value">${p.markets_fetched.toLocaleString()}</div></div>
-      <div class="card"><div class="label">orderFilled.csv</div><div class="value">${p.orderfilled_mb} MB</div></div>
-      <div class="card"><div class="label">trades.csv</div><div class="value">${p.trades_mb} MB</div></div>
+      <div class="card"><div class="label">fills/ (parquet)</div><div class="value">${p.orderfilled_mb} MB</div></div>
+      <div class="card"><div class="label">trades/ (parquet)</div><div class="value">${p.trades_mb} MB</div></div>
     </div>`+
     (preEvents?`<div class="sub" style="margin-top:8px">ℹ️ Los eventos OrderFilled empiezan en el bloque ~${p.events_from_block.toLocaleString()} (28-abr-2026). Hasta que el scan llegue ahí, trades/wallets/señales estarán vacíos — es lo esperado.</div>`:"");
 }

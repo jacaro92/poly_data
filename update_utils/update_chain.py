@@ -4,36 +4,36 @@ Polymarket CTF Exchange V2 OrderFilled event poller.
 Reads order-fill events directly from Polygon via JSON-RPC.
 No Goldsky, no subgraph, no API key beyond an optional RPC URL.
 
-Writes data/orderFilled.csv with columns matching the legacy v1 shape so the
-downstream processor can stay close to its original form:
-
-    timestamp, maker, makerAssetId, makerAmountFilled,
-    taker, takerAssetId, takerAmountFilled, transactionHash
+Writes data/fills/YYYYMMDD_BLOCKSTART.parquet (one file per 500-block chunk,
+no txHash column — reduces storage ~2x vs keeping it).
 
 Cursor (last block scanned) is persisted in data/cursor_state.json.
+
+Rolling retention: fill files older than FILLS_RETAIN_DAYS are deleted at
+startup. If the saved cursor is older than the retention window, it is
+automatically advanced so we never scan history we would immediately discard.
+
+Timestamp optimisation: instead of one eth_getBlockByNumber per event-bearing
+block (~500 calls per chunk), we fetch only the first and last block of each
+chunk and linearly interpolate. Polygon blocks are ~2 s apart, so the error
+is ±1 block (±2 s) — acceptable for P&L analytics.
 """
 
-import csv
-import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+import polars as pl
 from dotenv import load_dotenv
 from eth_abi import decode as abi_decode
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 
-# Load POLYGON_RPC_URL (and friends) from a .env in the project root.
 load_dotenv()
 
-# Polymarket CTF Exchange V2 on Polygon (deployed 2026-03-31).
-# Migration from v1 occurred on 2026-04-28.
 CTF_EXCHANGE_V2 = Web3.to_checksum_address("0xE111180000d2663C0091e4f400237545B87B996B")
 V2_GENESIS_BLOCK = 84_902_353
 
-# OrderFilled(bytes32,address,address,uint8,uint256,uint256,uint256,uint256,bytes32,bytes32)
-# 3 indexed params (orderHash, maker, taker) + 7 in data.
 ORDERFILLED_TOPIC = "0x" + Web3.keccak(
     text=(
         "OrderFilled(bytes32,address,address,uint8,uint256,"
@@ -42,43 +42,21 @@ ORDERFILLED_TOPIC = "0x" + Web3.keccak(
 ).hex().lstrip("0x")
 _DATA_TYPES = ["uint8", "uint256", "uint256", "uint256", "uint256", "bytes32", "bytes32"]
 
-OUTPUT_DIR = "data"
-OUTPUT_FILE = os.path.join(OUTPUT_DIR, "orderFilled.csv")
-CURSOR_FILE = os.path.join(OUTPUT_DIR, "cursor_state.json")
+# Output — one Parquet file per getLogs chunk, no txHash column.
+FILLS_DIR = os.path.join("data", "fills")
+CURSOR_FILE = os.path.join("data", "cursor_state.json")
 
-# Blocks per eth_getLogs call. Providers cap the per-query block range
-# (QuickNode's free tier is small; paid plans allow far more). Default is a
-# conservative free-tier value; set POLYGON_MAX_BLOCK_RANGE to your plan's limit
-# to backfill faster. If you raise it past what your RPC allows, the run stops
-# with an error telling you to lower it again.
+# Keep fill files for this many days. Cursor is advanced if it is older
+# than the retention window so we never scan history we would discard.
+FILLS_RETAIN_DAYS = int(os.getenv("FILLS_RETAIN_DAYS", "14"))
+# Approximate Polygon block rate used only for the cursor-advance heuristic.
+_BLOCKS_PER_DAY = 43_200
+
 BLOCK_RANGE = int(os.environ.get("POLYGON_MAX_BLOCK_RANGE", "5"))
-# Reorg-safety buffer for Polygon.
 CONFIRMATIONS = 20
-
-# Rate limiting (HTTP 429): wait and retry the SAME request, forever — unlike a
-# 413, shrinking the range only sends more requests and makes it worse. Backoff
-# grows exponentially (1s, 2s, 4s, …) up to one minute, then retries every
-# minute until the provider lets us through. We never give up.
 RATE_LIMIT_BACKOFF_MAX = 60.0
-# Transient connection failures on startup get a few retries before we give up
-# with a clear message (vs. a wrong URL / dead endpoint, which shouldn't hang).
 CONNECT_MAX_RETRIES = 5
-# Load-balanced public RPCs (e.g. 1rpc.io) mix full-history and pruned backends:
-# the same request can fail with "history has been pruned" and succeed on the
-# next attempt. Retry a bounded number of times before giving up, so a provider
-# that is *only* pruned (publicnode) still fails fast with the real error.
 PRUNED_MAX_RETRIES = 12
-
-COLUMNS = [
-    "timestamp",
-    "maker",
-    "makerAssetId",
-    "makerAmountFilled",
-    "taker",
-    "takerAssetId",
-    "takerAmountFilled",
-    "transactionHash",
-]
 
 DEFAULT_RPC = "https://polygon-bor-rpc.publicnode.com"
 
@@ -90,6 +68,7 @@ def _rpc_url() -> str:
 def _load_cursor() -> int:
     if os.path.isfile(CURSOR_FILE):
         try:
+            import json
             with open(CURSOR_FILE) as f:
                 last = json.load(f).get("last_block")
             if isinstance(last, int) and last >= V2_GENESIS_BLOCK:
@@ -100,13 +79,45 @@ def _load_cursor() -> int:
 
 
 def _save_cursor(next_block: int) -> None:
+    import json
     with open(CURSOR_FILE, "w") as f:
         json.dump({"last_block": next_block}, f)
 
 
+def _enforce_retention(cursor: int, safe_latest: int) -> int:
+    """Advance cursor if it is older than FILLS_RETAIN_DAYS to avoid scanning
+    history we will delete immediately."""
+    min_block = safe_latest - FILLS_RETAIN_DAYS * _BLOCKS_PER_DAY
+    if cursor < min_block:
+        print(
+            f"  Cursor {cursor:,} is older than {FILLS_RETAIN_DAYS} days; "
+            f"advancing to {min_block:,} (skipping {min_block - cursor:,} blocks)"
+        )
+        _save_cursor(min_block)
+        return min_block
+    return cursor
+
+
+def _cleanup_old_fills() -> None:
+    """Delete fill Parquet files whose date prefix is older than FILLS_RETAIN_DAYS."""
+    if not os.path.isdir(FILLS_DIR):
+        return
+    cutoff = (
+        datetime.now(tz=timezone.utc) - timedelta(days=FILLS_RETAIN_DAYS)
+    ).strftime("%Y%m%d")
+    removed = 0
+    for fname in os.listdir(FILLS_DIR):
+        if fname.endswith(".parquet") and fname[:8] < cutoff:
+            try:
+                os.remove(os.path.join(FILLS_DIR, fname))
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        print(f"  [cleanup] Removed {removed} fill file(s) older than {FILLS_RETAIN_DAYS} days")
+
+
 def _decode_log(log) -> dict:
-    """Decode a single OrderFilled log into a v1-shaped row."""
-    # topics: [event_sig, orderHash, maker, taker]
     topics = log["topics"]
     maker = "0x" + topics[2].hex()[-40:]
     taker = "0x" + topics[3].hex()[-40:]
@@ -119,29 +130,20 @@ def _decode_log(log) -> dict:
         _DATA_TYPES, data
     )
 
-    # V2 `side` reflects the MAKER order's side. BUY=0, SELL=1.
-    # process_live treats "0" as USDC and any other id as an outcome token.
     if side == 0:
-        # Maker buys tokens: gives USDC, gets tokens.
         maker_asset_id = "0"
         taker_asset_id = str(token_id)
     else:
-        # Maker sells tokens: gives tokens, gets USDC.
         maker_asset_id = str(token_id)
         taker_asset_id = "0"
-
-    tx_hash = log["transactionHash"]
-    if isinstance(tx_hash, (bytes, bytearray)):
-        tx_hash = "0x" + tx_hash.hex()
 
     return {
         "maker": maker.lower(),
         "taker": taker.lower(),
         "makerAssetId": maker_asset_id,
         "takerAssetId": taker_asset_id,
-        "makerAmountFilled": str(maker_amt),
-        "takerAmountFilled": str(taker_amt),
-        "transactionHash": tx_hash,
+        "makerAmountFilled": int(maker_amt),
+        "takerAmountFilled": int(taker_amt),
         "_block_number": log["blockNumber"],
     }
 
@@ -151,8 +153,6 @@ def _is_rate_limited(msg: str) -> bool:
 
 
 def _call_with_rate_retry(fn, what: str):
-    """Run an RPC call, retrying forever on HTTP 429 with exponential backoff
-    capped at one minute. Other errors propagate to the caller unchanged."""
     attempt = 0
     while True:
         try:
@@ -167,12 +167,6 @@ def _call_with_rate_retry(fn, what: str):
 
 
 def _connect(w3, rpc: str) -> int:
-    """Confirm the RPC is reachable and return the latest block number.
-
-    Calls block_number directly rather than w3.is_connected() — the latter
-    swallows the real error and returns False, hiding rate limits and giving us
-    nothing to retry on. 429s retry forever (via _call_with_rate_retry); other
-    transient failures retry a few times, then we raise with guidance."""
     for attempt in range(CONNECT_MAX_RETRIES):
         try:
             return _call_with_rate_retry(lambda: w3.eth.block_number, "block_number")
@@ -188,10 +182,6 @@ def _connect(w3, rpc: str) -> int:
 
 
 def _fetch_logs(w3, start: int, end: int):
-    """Fetch OrderFilled logs for [start, end]. Retries forever on 429 and a
-    bounded number of times on pruned-history errors (load-balanced backends).
-    If the RPC rejects the block range/response size, stop with guidance to
-    lower POLYGON_MAX_BLOCK_RANGE rather than silently shrinking."""
     pruned_attempt = 0
     while True:
         try:
@@ -208,7 +198,6 @@ def _fetch_logs(w3, start: int, end: int):
             )
         except Exception as e:
             msg = str(e).lower()
-            # Log the full error body so 400/500 responses are debuggable
             err_body = getattr(getattr(e, "response", None), "text", "")[:300]
             if err_body:
                 print(f"  ! RPC error body: {err_body}")
@@ -239,74 +228,95 @@ def _fetch_logs(w3, start: int, end: int):
             raise
 
 
+def _get_block_ts(w3, block_num: int) -> int:
+    return _call_with_rate_retry(
+        lambda b=block_num: w3.eth.get_block(b)["timestamp"],
+        f"get_block {block_num}",
+    )
+
+
 def update_chain() -> None:
-    if not os.path.isdir(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
+    os.makedirs(FILLS_DIR, exist_ok=True)
+    _cleanup_old_fills()
 
     rpc = _rpc_url()
     w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
-    # Polygon is PoA (Bor consensus) — extraData exceeds the 32-byte default validator.
     w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
     print(f"RPC: {rpc}")
     latest = _connect(w3, rpc)
     safe_latest = latest - CONFIRMATIONS
-    start_block = _load_cursor()
+    raw_cursor = _load_cursor()
+    start_block = _enforce_retention(raw_cursor, safe_latest)
 
     print(f"Latest block: {latest:,}  (safe: {safe_latest:,} after {CONFIRMATIONS} confs)")
-    print(f"Resuming from block {start_block:,}")
+    print(f"Scanning from block {start_block:,}  (retention: {FILLS_RETAIN_DAYS} days)")
 
     if start_block > safe_latest:
         print("Already up to date.")
         return
 
-    new_file = not os.path.isfile(OUTPUT_FILE)
-    if new_file:
-        with open(OUTPUT_FILE, "w", newline="") as f:
-            csv.writer(f).writerow(COLUMNS)
-
     cur = start_block
-    total = 0
-    ts_cache: dict = {}
+    total_new = 0
 
     while cur <= safe_latest:
         end = min(cur + BLOCK_RANGE - 1, safe_latest)
         logs = _fetch_logs(w3, cur, end)
 
         if logs:
+            # Fetch only the start and end block timestamps; interpolate linearly
+            # for all blocks in between. Reduces get_block calls from ~500 to 2
+            # per chunk — critical for rate-limited public RPCs.
+            ts_start = _get_block_ts(w3, cur)
+            ts_end = _get_block_ts(w3, end) if end > cur else ts_start
+
             rows = []
             for log in logs:
                 row = _decode_log(log)
-                bn = row.pop("_block_number")
-                if bn not in ts_cache:
-                    ts_cache[bn] = _call_with_rate_retry(
-                        lambda b=bn: w3.eth.get_block(b), f"get_block {bn}"
-                    )["timestamp"]
-                row["timestamp"] = ts_cache[bn]
-                rows.append([row[c] for c in COLUMNS])
+                bn = row["_block_number"]
+                frac = (bn - cur) / (end - cur) if end > cur else 0.0
+                ts = int(ts_start + frac * (ts_end - ts_start))
+                rows.append({
+                    "timestamp": ts,
+                    "maker": row["maker"],
+                    "makerAssetId": row["makerAssetId"],
+                    "makerAmountFilled": row["makerAmountFilled"],
+                    "taker": row["taker"],
+                    "takerAssetId": row["takerAssetId"],
+                    "takerAmountFilled": row["takerAmountFilled"],
+                })
 
-            with open(OUTPUT_FILE, "a", newline="") as f:
-                csv.writer(f).writerows(rows)
-            total += len(rows)
+            chunk_date = datetime.fromtimestamp(ts_start, tz=timezone.utc).strftime("%Y%m%d")
+            fname = f"{chunk_date}_{cur:012d}.parquet"
+            pl.DataFrame(
+                rows,
+                schema={
+                    "timestamp": pl.Int64,
+                    "maker": pl.Utf8,
+                    "makerAssetId": pl.Utf8,
+                    "makerAmountFilled": pl.Int64,
+                    "taker": pl.Utf8,
+                    "takerAssetId": pl.Utf8,
+                    "takerAmountFilled": pl.Int64,
+                },
+            ).write_parquet(os.path.join(FILLS_DIR, fname), compression="zstd")
+            total_new += len(rows)
 
-        readable = datetime.fromtimestamp(
-            ts_cache.get(end, time.time()), tz=timezone.utc
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        print(
-            f"  Blocks {cur:>10,} → {end:<10,} ({readable})  "
-            f"events: {len(logs):>4}  total: {total:,}"
-        )
+            readable = datetime.fromtimestamp(ts_start, tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            print(
+                f"  Blocks {cur:>12,} → {end:<12,} ({readable})  "
+                f"events: {len(logs):>5}  total: {total_new:,}  → {fname}"
+            )
+        else:
+            print(f"  Blocks {cur:>12,} → {end:<12,}  events:     0  total: {total_new:,}")
 
         cur = end + 1
         _save_cursor(cur)
+        time.sleep(0.05)
 
-        # Trim cache so it doesn't grow unboundedly across a long backfill.
-        if len(ts_cache) > 50_000:
-            ts_cache.clear()
-
-        time.sleep(0.05)  # be polite to free-tier RPCs
-
-    print(f"Done. Wrote {total:,} new rows to {OUTPUT_FILE}.")
+    print(f"Done. Wrote {total_new:,} new rows to {FILLS_DIR}/.")
 
 
 if __name__ == "__main__":

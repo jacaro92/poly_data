@@ -1,38 +1,112 @@
 """
 Join raw order-fill events with market metadata to produce labeled trades.
 
-Input:  data/orderFilled.csv  (written by update_chain.py)
-Output: processed/trades.csv
+Input:  data/fills/YYYYMMDD_BLOCKSTART.parquet  (written by update_chain.py)
+Output: processed/trades/YYYYMMDD.parquet       (one file per UTC day)
+
+Incremental: tracks the last processed fill file in processed/fill_cursor.json.
+Only new fill files (newer than the cursor) are processed each run.
+
+Rolling retention: trade files older than FILLS_RETAIN_DAYS are deleted to
+match the fill-file retention window.
 """
 
+import json
+import os
 import warnings
+from datetime import datetime, timedelta, timezone
 
 warnings.filterwarnings("ignore")
 
-import csv as csv_lib
-import os
-import subprocess
-import sys
-
-import pandas as pd
 import polars as pl
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from poly_utils.utils import get_lean_markets, update_missing_tokens
 
-ORDERS_CSV = "data/orderFilled.csv"
-TRADES_CSV = "processed/trades.csv"
-
-# Chunk size for streaming the orders CSV through the join.
-# Default 0 = chunking disabled (load everything in one pass).
-# Set e.g. PROCESS_CHUNK_SIZE=500000 to bound memory on large orderFilled.csv files.
-CHUNK_SIZE = int(os.environ.get("PROCESS_CHUNK_SIZE", "0"))
+FILLS_DIR = "data/fills"
+TRADES_DIR = "processed/trades"
+FILL_CURSOR_FILE = "processed/fill_cursor.json"
+FILLS_RETAIN_DAYS = int(os.environ.get("FILLS_RETAIN_DAYS", "14"))
 
 
-def _processed_df(df: pl.DataFrame, markets_df: pl.DataFrame) -> pl.DataFrame:
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _load_fill_cursor() -> str | None:
+    if os.path.isfile(FILL_CURSOR_FILE):
+        try:
+            with open(FILL_CURSOR_FILE) as f:
+                return json.load(f).get("last")
+        except Exception:
+            pass
+    return None
+
+
+def _save_fill_cursor(fname: str) -> None:
+    os.makedirs(os.path.dirname(FILL_CURSOR_FILE), exist_ok=True)
+    with open(FILL_CURSOR_FILE, "w") as f:
+        json.dump({"last": fname}, f)
+
+
+def _list_fill_files() -> list[str]:
+    """Sorted list of absolute paths to fill parquet files."""
+    if not os.path.isdir(FILLS_DIR):
+        return []
+    return sorted(
+        os.path.join(FILLS_DIR, f)
+        for f in os.listdir(FILLS_DIR)
+        if f.endswith(".parquet")
+    )
+
+
+def _cleanup_old_trades() -> None:
+    if not os.path.isdir(TRADES_DIR):
+        return
+    cutoff = (
+        datetime.now(tz=timezone.utc) - timedelta(days=FILLS_RETAIN_DAYS)
+    ).strftime("%Y%m%d")
+    removed = 0
+    for fname in os.listdir(TRADES_DIR):
+        if fname.endswith(".parquet") and fname.replace(".parquet", "") < cutoff:
+            try:
+                os.remove(os.path.join(TRADES_DIR, fname))
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        print(f"  [cleanup] Removed {removed} old trade file(s)")
+
+
+def _discover_missing_tokens(markets_df: pl.DataFrame) -> None:
+    fill_files = _list_fill_files()
+    if not fill_files:
+        return
+    df = (
+        pl.scan_parquet(fill_files)
+        .select(["makerAssetId", "takerAssetId"])
+        .collect()
+    )
+    trade_asset_ids = (
+        set(df["makerAssetId"].drop_nulls().to_list())
+        | set(df["takerAssetId"].drop_nulls().to_list())
+    ) - {"0"}
+
+    existing: set = set()
+    for col in ("token1", "token2"):
+        if col in markets_df.columns:
+            existing.update(markets_df[col].drop_nulls().to_list())
+
+    missing = sorted(trade_asset_ids - existing)
+    if missing:
+        print(f"🔍 {len(missing)} markets not in markets.csv — fetching from Polymarket API")
+        update_missing_tokens(missing)
+    else:
+        print("✅ All markets present")
+
+
+# ── core join ─────────────────────────────────────────────────────────────────
+
+def _processed_df(fills: pl.DataFrame, markets_df: pl.DataFrame) -> pl.DataFrame:
+    """Join fills with market metadata and compute derived trade columns."""
     markets_df = markets_df.rename({"id": "market_id"})
-
     markets_long = markets_df.select(["market_id", "token1", "token2"]).melt(
         id_vars="market_id",
         value_vars=["token1", "token2"],
@@ -40,21 +114,29 @@ def _processed_df(df: pl.DataFrame, markets_df: pl.DataFrame) -> pl.DataFrame:
         value_name="asset_id",
     )
 
-    df = df.with_columns(
+    # Convert unix timestamp to datetime
+    fills = fills.with_columns(
+        pl.from_epoch(pl.col("timestamp"), time_unit="s").alias("timestamp")
+    )
+
+    # Scale amounts from raw (6 decimals) to USD/token units
+    fills = fills.with_columns(
+        [
+            (pl.col("makerAmountFilled") / 10**6).alias("makerAmountFilled"),
+            (pl.col("takerAmountFilled") / 10**6).alias("takerAmountFilled"),
+        ]
+    )
+
+    fills = fills.with_columns(
         pl.when(pl.col("makerAssetId") != "0")
         .then(pl.col("makerAssetId"))
         .otherwise(pl.col("takerAssetId"))
         .alias("nonusdc_asset_id")
     )
 
-    df = df.join(
-        markets_long,
-        left_on="nonusdc_asset_id",
-        right_on="asset_id",
-        how="left",
-    )
+    fills = fills.join(markets_long, left_on="nonusdc_asset_id", right_on="asset_id", how="left")
 
-    df = df.with_columns(
+    fills = fills.with_columns(
         [
             pl.when(pl.col("makerAssetId") == "0")
             .then(pl.lit("USDC"))
@@ -68,30 +150,7 @@ def _processed_df(df: pl.DataFrame, markets_df: pl.DataFrame) -> pl.DataFrame:
         ]
     )
 
-    df = df[
-        [
-            "timestamp",
-            "market_id",
-            "maker",
-            "makerAsset",
-            "makerAssetId",
-            "makerAmountFilled",
-            "taker",
-            "takerAsset",
-            "takerAmountFilled",
-            "transactionHash",
-        ]
-    ]
-
-    # USDC has 6 decimals. Outcome tokens also have 6 (CTF wraps to 6 for parity).
-    df = df.with_columns(
-        [
-            (pl.col("makerAmountFilled") / 10**6).alias("makerAmountFilled"),
-            (pl.col("takerAmountFilled") / 10**6).alias("takerAmountFilled"),
-        ]
-    )
-
-    df = df.with_columns(
+    fills = fills.with_columns(
         [
             pl.when(pl.col("takerAsset") == "USDC")
             .then(pl.lit("BUY"))
@@ -104,10 +163,8 @@ def _processed_df(df: pl.DataFrame, markets_df: pl.DataFrame) -> pl.DataFrame:
         ]
     )
 
-    df = df.with_columns(
+    fills = fills.with_columns(
         [
-            # Derive from the raw assetId (never null) so unknown markets stay null
-            # instead of leaking the literal "USDC" through polars three-valued logic.
             pl.when(pl.col("makerAssetId") == "0")
             .then(pl.col("takerAsset"))
             .otherwise(pl.col("makerAsset"))
@@ -128,7 +185,7 @@ def _processed_df(df: pl.DataFrame, markets_df: pl.DataFrame) -> pl.DataFrame:
         ]
     )
 
-    return df[
+    return fills.select(
         [
             "timestamp",
             "market_id",
@@ -140,166 +197,75 @@ def _processed_df(df: pl.DataFrame, markets_df: pl.DataFrame) -> pl.DataFrame:
             "price",
             "usd_amount",
             "token_amount",
-            "transactionHash",
         ]
-    ]
-
-
-def _last_processed_marker():
-    if not os.path.exists(TRADES_CSV):
-        return None
-    result = subprocess.run(["tail", "-n", "1", TRADES_CSV], capture_output=True, text=True)
-    last_line = result.stdout.strip()
-    if not last_line:
-        return None
-    parts = last_line.split(",")
-    if len(parts) < 4:
-        return None
-    return {
-        "timestamp": pd.to_datetime(parts[0]),
-        "transactionHash": parts[-1],
-        "maker": parts[2],
-        "taker": parts[3],
-    }
-
-
-def _discover_missing_tokens(markets_df: pl.DataFrame) -> None:
-    """Scan orderFilled.csv for asset IDs not present in markets and fetch them."""
-    maker_ids: set = set()
-    taker_ids: set = set()
-    with open(ORDERS_CSV, newline="", encoding="utf-8") as f:
-        reader = csv_lib.DictReader(f)
-        for row in reader:
-            if row.get("makerAssetId", "0") != "0":
-                maker_ids.add(row["makerAssetId"])
-            if row.get("takerAssetId", "0") != "0":
-                taker_ids.add(row["takerAssetId"])
-    trade_asset_ids = maker_ids | taker_ids
-
-    existing = set()
-    for col in ("token1", "token2"):
-        if col in markets_df.columns:
-            existing.update(markets_df[col].drop_nulls().to_list())
-
-    missing = sorted(trade_asset_ids - existing)
-    if missing:
-        print(f"🔍 {len(missing)} markets not in markets.csv — fetching from Polymarket API")
-        update_missing_tokens(missing)
-    else:
-        print("✅ All markets present")
-
-
-def _match_marker(chunk: pl.DataFrame, last: dict) -> int | None:
-    """Return the row index in `chunk` matching the last-processed marker, or None."""
-    mask = chunk.with_row_index().filter(
-        (pl.col("timestamp") == last["timestamp"])
-        & (pl.col("transactionHash") == last["transactionHash"])
-        & (pl.col("maker") == last["maker"])
-        & (pl.col("taker") == last["taker"])
     )
-    if mask.is_empty():
-        return None
-    return int(mask.row(0)[0])
 
 
-def _accumulate(reader, target_rows: int):
-    """Pull batches from the polars batched reader until we have at least
-    `target_rows` rows, or the reader is exhausted. polars's batch_size is
-    an I/O hint, not a row count — without this we get hundreds of tiny
-    chunks and pay the join setup cost repeatedly.
-    """
-    parts: list = []
-    rows = 0
-    while rows < target_rows:
-        batches = reader.next_batches(1)
-        if not batches:
-            break
-        parts.append(batches[0])
-        rows += len(batches[0])
-    if not parts:
-        return None
-    return parts[0] if len(parts) == 1 else pl.concat(parts)
-
-
-def _write_chunk(trades: pl.DataFrame, first_write: bool) -> None:
-    if first_write and not os.path.isfile(TRADES_CSV):
-        trades.write_csv(TRADES_CSV)
-    else:
-        with open(TRADES_CSV, mode="a") as f:
-            trades.write_csv(f, include_header=False)
-
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def process_live() -> None:
     print("=" * 60)
     print("🔄 Processing trades")
     print("=" * 60)
 
-    if not os.path.exists(ORDERS_CSV):
-        print(f"⚠ {ORDERS_CSV} not found — run update_chain() first")
+    all_fill_files = _list_fill_files()
+    if not all_fill_files:
+        print(f"⚠ No fill parquet files in {FILLS_DIR} — run update_chain() first")
         return
 
-    last = _last_processed_marker()
-    if last:
-        print(f"📍 Resuming after {last['timestamp']}  ({last['transactionHash'][:16]}…)")
+    # Determine which fill files are new (after the cursor)
+    cursor_fname = _load_fill_cursor()
+    all_fnames = [os.path.basename(p) for p in all_fill_files]
+    if cursor_fname and cursor_fname in all_fnames:
+        idx = all_fnames.index(cursor_fname)
+        new_files = all_fill_files[idx + 1:]
     else:
-        print("⚠ No existing trades.csv — processing from beginning")
+        new_files = all_fill_files
 
-    # Streaming discovery pass (already low-memory via DictReader). Run first so
-    # update_missing_tokens populates missing_markets.csv before we load markets.
+    if not new_files:
+        print("✓ No new fill files to process.")
+        return
+
+    print(f"📍 Processing {len(new_files)} new fill file(s) (cursor: {cursor_fname or 'none'})")
+
     markets_df = get_lean_markets()
     _discover_missing_tokens(markets_df)
-    markets_df = get_lean_markets()  # reload if backfilled
+    markets_df = get_lean_markets()
 
-    os.makedirs("processed", exist_ok=True)
+    os.makedirs(TRADES_DIR, exist_ok=True)
+    _cleanup_old_trades()
 
-    overrides = {"makerAssetId": pl.Utf8, "takerAssetId": pl.Utf8}
+    # Group new fill files by UTC date (first 8 chars of filename = YYYYMMDD)
+    by_date: dict[str, list[str]] = {}
+    for path in new_files:
+        date_str = os.path.basename(path)[:8]
+        by_date.setdefault(date_str, []).append(path)
 
-    # Single reader path for both modes. CHUNK_SIZE=0 means "load everything"
-    # (accumulate all batches into one before processing). >0 streams per-chunk.
-    # Use a big batch_size as an I/O hint — polars treats it as a ceiling, not target.
-    target_per_chunk = CHUNK_SIZE if CHUNK_SIZE > 0 else sys.maxsize
-    reader = pl.read_csv_batched(
-        ORDERS_CSV,
-        schema_overrides=overrides,
-        batch_size=CHUNK_SIZE if CHUNK_SIZE > 0 else 100_000,
-    )
+    total_new_trades = 0
+    last_processed_fname: str | None = None
 
-    if CHUNK_SIZE > 0:
-        print(f"⚙️  Streaming in chunks of {CHUNK_SIZE:,} rows")
-    else:
-        print("⚙️  Loading all order events (chunking disabled)")
+    for date_str in sorted(by_date):
+        paths = by_date[date_str]
+        fills_chunk = pl.concat([pl.read_parquet(p) for p in paths])
+        trades_chunk = _processed_df(fills_chunk, markets_df)
 
-    resumed = last is None
-    total_written = 0
-    first_write = not os.path.isfile(TRADES_CSV)
+        trades_file = os.path.join(TRADES_DIR, f"{date_str}.parquet")
+        if os.path.isfile(trades_file):
+            existing = pl.read_parquet(trades_file)
+            trades_chunk = pl.concat([existing, trades_chunk])
 
-    while True:
-        chunk = _accumulate(reader, target_per_chunk)
-        if chunk is None:
-            break
-        chunk = chunk.with_columns(
-            pl.from_epoch(pl.col("timestamp"), time_unit="s").alias("timestamp")
+        trades_chunk.write_parquet(trades_file, compression="zstd")
+        total_new_trades += len(trades_chunk)
+        last_processed_fname = os.path.basename(paths[-1])
+        print(
+            f"  {date_str}: {len(fills_chunk):,} new fills "
+            f"→ {trades_file} ({len(trades_chunk):,} trades total)"
         )
-        if not resumed:
-            marker_idx = _match_marker(chunk, last)
-            if marker_idx is None:
-                continue  # marker not in this chunk, skip entirely
-            chunk = chunk.slice(marker_idx + 1)
-            resumed = True
-            if chunk.is_empty():
-                continue
-        trades_chunk = _processed_df(chunk, markets_df)
-        _write_chunk(trades_chunk, first_write=first_write)
-        first_write = False
-        total_written += len(trades_chunk)
-        if CHUNK_SIZE > 0:
-            print(f"  +{len(trades_chunk):,} rows  (total: {total_written:,})")
 
-    if not resumed:
-        print("⚠ Last-processed marker not found anywhere; nothing written")
-    else:
-        print(f"✓ Done. Wrote {total_written:,} rows → {TRADES_CSV}")
+    if last_processed_fname:
+        _save_fill_cursor(last_processed_fname)
 
+    print(f"✓ Done. Processed {len(new_files)} fill file(s), {total_new_trades:,} trade rows.")
     print("=" * 60)
     print("✅ Done")
     print("=" * 60)
