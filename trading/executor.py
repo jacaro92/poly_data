@@ -107,6 +107,25 @@ class PolymarketExecutor:
                 return 0.0
         return 0.0
 
+    def collateral_balance(self) -> float:
+        """Saldo de colateral (pUSD/USDC) en el CLOB, en USD. -1.0 si falla.
+        Sirve para medir el gasto/ingreso real de una orden por diferencia
+        de saldo antes/después (las respuestas del CLOB no traen el importe
+        ejecutado)."""
+        try:
+            from py_clob_client_v2.clob_types import (
+                AssetType,
+                BalanceAllowanceParams,
+            )
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=config.SIGNATURE_TYPE,
+            )
+            resp = self.client.get_balance_allowance(params)
+            return float((resp or {}).get("balance", 0)) / 1_000_000.0
+        except Exception:
+            return -1.0
+
     def order_book(self, token_id: str):
         return self.client.get_order_book(token_id)
 
@@ -203,22 +222,39 @@ class PolymarketExecutor:
         question: str = "",
         market_url: str = "",
     ):
-        """Orden a mercado: gasta `usd_amount` USDC en el token (FOK)."""
+        """Orden a mercado: gasta `usd_amount` USDC en el token (FOK).
+
+        Devuelve dict con el resultado y el FILL REAL (precio medio y coste
+        efectivos, medidos por delta de colateral y shares recibidas), para
+        contabilizar el P&L con el precio ejecutado y no con el midpoint
+        (que ignora el spread: se compra al ask)."""
         self._guard()
+        bal_before = self.collateral_balance()
         order = self.client.create_market_order(
             MarketOrderArgsV2(token_id=token_id, amount=usd_amount, side=BUY)
         )
         result = self.client.post_order(order, OrderType.FOK)
-        mid = self._midpoint_price(token_id)
+        bal_after = self.collateral_balance()
+        shares = self.held_shares(token_id)
+        spent = bal_before - bal_after if (bal_before >= 0 and bal_after >= 0 and bal_before > bal_after) else usd_amount
+        if shares > 0:
+            fill_price = spent / shares
+        else:  # no se pudo leer el saldo de shares: cae al midpoint
+            fill_price = self._midpoint_price(token_id) or 0.0
         self.notifier.notify_trade_opened(
             question=question or token_id,
             direction="BUY_YES",
-            price=float(mid),
-            size_usd=usd_amount,
+            price=float(fill_price),
+            size_usd=round(spent, 2),
             market_url=market_url,
             is_live=True,
         )
-        return result
+        return {
+            "result": result,
+            "fill_price": round(fill_price, 4),
+            "shares": round(shares, 4),
+            "spent": round(spent, 2),
+        }
 
     def sell_market(
         self,
@@ -233,22 +269,35 @@ class PolymarketExecutor:
         held = self.held_shares(token_id)
         if held > 0:
             shares = min(shares, held)
+        bal_before = self.collateral_balance()
         order = self.client.create_market_order(
             MarketOrderArgsV2(token_id=token_id, amount=shares, side=SELL)
         )
         result = self.client.post_order(order, OrderType.FOK)
+        bal_after = self.collateral_balance()
+        proceeds = bal_after - bal_before if (bal_before >= 0 and bal_after >= 0 and bal_after > bal_before) else 0.0
+        # Precio de venta REAL (se vende al bid): proceeds/shares; si no se
+        # pudo medir, cae al midpoint.
+        if proceeds > 0 and shares > 0:
+            fill_price = proceeds / shares
+        else:
+            fill_price = self._midpoint_price(token_id) or 0.0
         if question and entry_price > 0:
-            mid = self._midpoint_price(token_id)
             self.notifier.notify_trade_closed(
                 question=question,
                 direction="BUY_YES",
                 entry_price=entry_price,
-                exit_price=float(mid),
+                exit_price=float(fill_price),
                 size_usd=shares * entry_price,
                 reason=reason,
                 market_url=market_url,
             )
-        return result
+        return {
+            "result": result,
+            "fill_price": round(fill_price, 4),
+            "proceeds": round(proceeds, 2),
+            "shares": round(shares, 4),
+        }
 
     def cancel_all(self):
         self._guard()

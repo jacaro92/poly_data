@@ -224,9 +224,14 @@ class CopyTrader:
 
         if self.executor:
             try:
-                self.executor.buy_market(token_id, size_usd, question=question, market_url=url)
-                # Descuenta del balance cacheado para no seguir intentando
-                # compras sin capital dentro de la ventana de caché (120s).
+                fill = self.executor.buy_market(token_id, size_usd, question=question, market_url=url)
+                # Contabilizar con el precio y coste REALES de ejecución (se
+                # compra al ask; el midpoint subestima el coste). open_position
+                # derivará las shares reales = spent / fill_price.
+                entry = fill.get("fill_price") or entry
+                size_usd = fill.get("spent") or size_usd
+                # Descuenta lo realmente gastado del balance cacheado para no
+                # seguir intentando compras sin capital (ventana de caché 120s).
                 ts, total = self._balance_cache
                 self._balance_cache = (ts, max(0.0, total - size_usd))
             except Exception as e:
@@ -261,11 +266,15 @@ class CopyTrader:
     def exit_position(self, pos: dict, exit_price: float, reason: str) -> None:
         if self.executor and pos.get("is_live"):
             try:
-                self.executor.sell_market(
+                fill = self.executor.sell_market(
                     pos["token_id"], pos["shares"],
                     question=pos["question"], market_url=pos.get("market_url", ""),
                     entry_price=pos["entry_price"], reason=reason,
                 )
+                # P&L con el precio de venta REAL (se vende al bid; el midpoint
+                # lo sobreestima).
+                if fill.get("fill_price"):
+                    exit_price = fill["fill_price"]
             except Exception as e:
                 msg = str(e)
                 print(f"  ✗ venta falló ({reason}): {msg}")
