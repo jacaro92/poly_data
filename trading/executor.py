@@ -17,6 +17,8 @@ Las funciones de solo lectura (balance, midpoint, open_orders) funcionan
 siempre; las que envían órdenes exigen AUTO_EXECUTE=true.
 """
 
+import time
+
 # CLOB V2 (Polymarket migró el dominio EIP-712 de "1" a "2" el 28-abr-2026;
 # el paquete viejo py-clob-client quedó obsoleto → "invalid order version").
 from py_clob_client_v2 import ClobClient
@@ -24,6 +26,7 @@ from py_clob_client_v2.clob_types import (
     MarketOrderArgsV2,
     OrderArgsV2,
     OrderType,
+    TradeParams,
 )
 from py_clob_client_v2.order_builder.constants import BUY, SELL
 
@@ -125,6 +128,37 @@ class PolymarketExecutor:
             return float((resp or {}).get("balance", 0)) / 1_000_000.0
         except Exception:
             return -1.0
+
+    def _last_fill_price(self, token_id: str, side: str, since_ts: int) -> float:
+        """Precio de ejecución REAL de nuestra última orden en este token,
+        leído de get_trades (fuente autoritativa). El CLOB no devuelve el
+        importe ejecutado en la respuesta de la orden, y el saldo de colateral
+        no se actualiza síncrono; get_trades sí registra el fill al instante.
+        Media ponderada por tamaño si la orden cruzó varios niveles. Devuelve
+        0.0 si no se encuentra (el caller cae al midpoint)."""
+        for _ in range(4):
+            try:
+                trades = self.client.get_trades(
+                    TradeParams(asset_id=token_id), only_first_page=True
+                )
+            except Exception:
+                trades = []
+            ours = [
+                t for t in trades
+                if t.get("side") == side
+                and int(t.get("match_time", 0) or 0) >= since_ts
+            ]
+            if ours:
+                latest = max(int(t.get("match_time", 0) or 0) for t in ours)
+                batch = [t for t in ours if int(t.get("match_time", 0) or 0) == latest]
+                sz = sum(float(t.get("size", 0) or 0) for t in batch)
+                if sz > 0:
+                    return sum(
+                        float(t.get("price", 0) or 0) * float(t.get("size", 0) or 0)
+                        for t in batch
+                    ) / sz
+            time.sleep(0.7)
+        return 0.0
 
     def order_book(self, token_id: str):
         return self.client.get_order_book(token_id)
@@ -229,23 +263,19 @@ class PolymarketExecutor:
         contabilizar el P&L con el precio ejecutado y no con el midpoint
         (que ignora el spread: se compra al ask)."""
         self._guard()
-        bal_before = self.collateral_balance()
+        t0 = int(time.time()) - 2
         order = self.client.create_market_order(
             MarketOrderArgsV2(token_id=token_id, amount=usd_amount, side=BUY)
         )
         result = self.client.post_order(order, OrderType.FOK)
-        bal_after = self.collateral_balance()
         shares = self.held_shares(token_id)
-        spent = bal_before - bal_after if (bal_before >= 0 and bal_after >= 0 and bal_before > bal_after) else usd_amount
-        if shares > 0:
-            fill_price = spent / shares
-        else:  # no se pudo leer el saldo de shares: cae al midpoint
-            fill_price = self._midpoint_price(token_id) or 0.0
+        fill_price = self._last_fill_price(token_id, BUY, t0) or self._midpoint_price(token_id) or 0.0
+        spent = round(fill_price * shares, 2) if (fill_price > 0 and shares > 0) else round(usd_amount, 2)
         self.notifier.notify_trade_opened(
             question=question or token_id,
             direction="BUY_YES",
             price=float(fill_price),
-            size_usd=round(spent, 2),
+            size_usd=spent,
             market_url=market_url,
             is_live=True,
         )
@@ -253,7 +283,7 @@ class PolymarketExecutor:
             "result": result,
             "fill_price": round(fill_price, 4),
             "shares": round(shares, 4),
-            "spent": round(spent, 2),
+            "spent": spent,
         }
 
     def sell_market(
@@ -269,19 +299,15 @@ class PolymarketExecutor:
         held = self.held_shares(token_id)
         if held > 0:
             shares = min(shares, held)
-        bal_before = self.collateral_balance()
+        t0 = int(time.time()) - 2
         order = self.client.create_market_order(
             MarketOrderArgsV2(token_id=token_id, amount=shares, side=SELL)
         )
         result = self.client.post_order(order, OrderType.FOK)
-        bal_after = self.collateral_balance()
-        proceeds = bal_after - bal_before if (bal_before >= 0 and bal_after >= 0 and bal_after > bal_before) else 0.0
-        # Precio de venta REAL (se vende al bid): proceeds/shares; si no se
-        # pudo medir, cae al midpoint.
-        if proceeds > 0 and shares > 0:
-            fill_price = proceeds / shares
-        else:
-            fill_price = self._midpoint_price(token_id) or 0.0
+        # Precio de venta REAL (se vende al bid) leído de get_trades; fallback
+        # al midpoint si no se encuentra el fill.
+        fill_price = self._last_fill_price(token_id, SELL, t0) or self._midpoint_price(token_id) or 0.0
+        proceeds = round(fill_price * shares, 2) if fill_price > 0 else 0.0
         if question and entry_price > 0:
             self.notifier.notify_trade_closed(
                 question=question,
