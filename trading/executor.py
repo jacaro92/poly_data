@@ -77,6 +77,36 @@ class PolymarketExecutor:
         except Exception:
             return 0.0
 
+    def held_shares(self, token_id: str) -> float:
+        """Shares (outcome tokens) que realmente se poseen del token, según el
+        CLOB. El market-buy FOK deja algo menos de shares que size/precio
+        (fees/redondeo); vender pos['shares'] da 'not enough balance'. Como el
+        SDK redondea el size a la baja, vender este saldo real nunca excede lo
+        disponible. Devuelve 0.0 si no se puede leer (el caller decide).
+
+        Se reintenta una vez: la PRIMERA llamada CONDITIONAL de cada cliente
+        py-clob-client-v2 falla con 'assetId invalid value -1' (bug del SDK);
+        la segunda ya resuelve bien el tokenId."""
+        from py_clob_client_v2.clob_types import (
+            AssetType,
+            BalanceAllowanceParams,
+        )
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL,
+            token_id=token_id,
+            signature_type=config.SIGNATURE_TYPE,
+        )
+        for attempt in range(2):
+            try:
+                resp = self.client.get_balance_allowance(params)
+                raw = float((resp or {}).get("balance", 0))
+                return raw / 1_000_000.0
+            except Exception:
+                if attempt == 0:
+                    continue
+                return 0.0
+        return 0.0
+
     def order_book(self, token_id: str):
         return self.client.get_order_book(token_id)
 
@@ -147,6 +177,9 @@ class PolymarketExecutor:
         reason: str = "MANUAL",
     ):
         self._guard()
+        held = self.held_shares(token_id)
+        if held > 0:
+            size = min(size, held)
         order = self.client.create_order(
             OrderArgsV2(token_id=token_id, price=price, size=size, side=SELL)
         )
@@ -197,6 +230,9 @@ class PolymarketExecutor:
         reason: str = "MANUAL",
     ):
         self._guard()
+        held = self.held_shares(token_id)
+        if held > 0:
+            shares = min(shares, held)
         order = self.client.create_market_order(
             MarketOrderArgsV2(token_id=token_id, amount=shares, side=SELL)
         )

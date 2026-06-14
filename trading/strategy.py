@@ -217,9 +217,16 @@ class CopyTrader:
         if self.executor:
             try:
                 self.executor.buy_market(token_id, size_usd, question=question, market_url=url)
+                # Descuenta del balance cacheado para no seguir intentando
+                # compras sin capital dentro de la ventana de caché (120s).
+                ts, total = self._balance_cache
+                self._balance_cache = (ts, max(0.0, total - size_usd))
             except Exception as e:
                 print(f"  ✗ orden falló: {e}")
-                self.notifier.notify_error(f"buy_market {question[:50]}", str(e))
+                # 'not enough balance' es un límite de capital esperado, no un
+                # fallo del sistema: no satures Telegram con ello.
+                if "not enough balance" not in str(e):
+                    self.notifier.notify_error(f"buy_market {question[:50]}", str(e))
                 return
         else:
             self.notifier.notify_trade_opened(
