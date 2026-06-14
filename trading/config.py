@@ -74,6 +74,22 @@ COPY_TOP_N = int(os.environ.get("COPY_TOP_N", "5"))
 # Filtra el ruido de micro-trades y rebalanceos.
 MIN_COPY_TRADE_USD = float(os.environ.get("MIN_COPY_TRADE_USD", "50.0"))
 
+# ── Filtro de calidad de wallets (wallet_analyzer) ──────────────────────────
+# Excluye del ranking wallets NO copiables con retraso:
+#   - Market-makers / bots HFT: nº de acciones disparatado (ganan por spread y
+#     rewards, no por dirección; copiarlos paga el peaje que ellos cobran).
+#   - Arbitrajistas de resolución: win_rate ~100% con muy pocos lotes cerrados
+#     (compran a 0.98 justo antes de resolver; sin margen copiable).
+MIN_WALLET_LOTS = int(os.environ.get("MIN_WALLET_LOTS", "10"))       # track record mínimo
+MAX_WALLET_TRADES = int(os.environ.get("MAX_WALLET_TRADES", "20000"))  # excluye MM/HFT
+MAX_WALLET_WIN_RATE = float(os.environ.get("MAX_WALLET_WIN_RATE", "0.99"))  # excluye arb perfecto
+
+# ── Filtro de spread en la entrada ──────────────────────────────────────────
+# No copiar en mercados ilíquidos: con spread ancho se paga el peaje al cruzar
+# el libro en compra (ask) y venta (bid). Spread relativo = (ask-bid)/mid.
+# 0 = desactivado. Sin libro (sin bids/asks) también se descarta.
+MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "0.05"))
+
 # Límites de cartera y de entrada.
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "3"))
 ENTRY_PRICE_MIN = float(os.environ.get("ENTRY_PRICE_MIN", "0.10"))

@@ -163,15 +163,27 @@ def analyze(min_trades: int = 10, min_volume: float = 100.0) -> pl.DataFrame:
 
     wallet_stats = _compute_pnl(agg)
 
+    # Filtro de calidad: excluir market-makers/HFT (nº de acciones disparatado)
+    # y arbitrajistas de resolución (win_rate ~100% con pocos lotes). No son
+    # copiables con retraso. Configurable por entorno.
+    min_lots = int(os.environ.get("MIN_WALLET_LOTS", "10"))
+    max_trades = int(os.environ.get("MAX_WALLET_TRADES", "20000"))
+    max_win_rate = float(os.environ.get("MAX_WALLET_WIN_RATE", "0.99"))
+
     ranking = (
         wallet_stats
-        .filter(
-            (pl.col("n_trades") >= min_trades)
-            & (pl.col("volume_buy") >= min_volume)
-        )
         .with_columns([
             (pl.col("realized_pnl") / pl.col("volume_buy")).alias("roi"),
             (pl.col("wins") / pl.col("closed_lots")).alias("win_rate"),
+        ])
+        .filter(
+            (pl.col("n_trades") >= min_trades)
+            & (pl.col("volume_buy") >= min_volume)
+            & (pl.col("closed_lots") >= min_lots)       # track record real
+            & (pl.col("n_trades") <= max_trades)        # excluye MM/HFT
+            & (pl.col("win_rate") <= max_win_rate)      # excluye arb perfecto
+        )
+        .with_columns([
             pl.col("realized_pnl").round(2),
             pl.col("volume_buy").round(2),
         ])
@@ -180,6 +192,10 @@ def analyze(min_trades: int = 10, min_volume: float = 100.0) -> pl.DataFrame:
             "wallet", "realized_pnl", "roi", "win_rate",
             "closed_lots", "n_trades", "volume_buy",
         ])
+    )
+    print(
+        f"  Filtro wallets: lots>={min_lots}, trades<={max_trades}, "
+        f"win_rate<={max_win_rate} → {len(ranking)} copiables"
     )
 
     if ranking.is_empty():

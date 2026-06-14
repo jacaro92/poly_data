@@ -93,6 +93,24 @@ def midpoint(token_id: str) -> float | None:
         return None
 
 
+def best_bid_ask(token_id: str) -> tuple[float | None, float | None]:
+    """(mejor_bid, mejor_ask) del libro público del CLOB. (None, None) si falla
+    o el libro está vacío de ese lado. Para medir el spread antes de entrar."""
+    try:
+        resp = _session.get(
+            f"{config.CLOB_HOST}/book", params={"token_id": token_id}, timeout=10
+        )
+        resp.raise_for_status()
+        book = resp.json()
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        best_bid = max((float(b["price"]) for b in bids), default=None)
+        best_ask = min((float(a["price"]) for a in asks), default=None)
+        return best_bid, best_ask
+    except Exception:
+        return None, None
+
+
 def market_url(trade: dict) -> str:
     slug = trade.get("eventSlug") or trade.get("slug") or ""
     return f"https://polymarket.com/event/{slug}" if slug else ""
@@ -203,6 +221,16 @@ class CopyTrader:
                 skip = f"entrada {entry:.3f} fuera de [{config.ENTRY_PRICE_MIN}, {config.ENTRY_PRICE_MAX}]"
             elif config.AUTO_EXECUTE and self.balance() < size_usd:
                 skip = f"balance ${self.balance():.2f} < tamaño ${size_usd:.2f}"
+            elif config.MAX_SPREAD_PCT > 0:
+                # Mercado ilíquido = spread ancho: se paga el peaje al cruzar el
+                # libro al entrar (ask) y salir (bid). Sin libro = inservible.
+                bid, ask = best_bid_ask(token_id)
+                if not bid or not ask:
+                    skip = "mercado sin libro (ilíquido)"
+                else:
+                    rel = (ask - bid) / ((ask + bid) / 2.0)
+                    if rel > config.MAX_SPREAD_PCT:
+                        skip = f"spread {rel:.0%} > {config.MAX_SPREAD_PCT:.0%} (ilíquido)"
 
         positions.log_signal(
             self.state,
