@@ -1,0 +1,1 @@
+# 2026-06-14  go-live: AUTO_EXECUTE=true, TRADE_SIZE_USD=4, SIM PnL +8.58
