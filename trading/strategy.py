@@ -269,17 +269,26 @@ class CopyTrader:
             except Exception as e:
                 msg = str(e)
                 print(f"  ✗ venta falló ({reason}): {msg}")
-                if reason == "RESOLVED":
-                    # Mercado resuelto: a menudo sin liquidez (0 bids → 'no
-                    # match'). No se puede vender, pero los outcome tokens se
-                    # redimen on-chain a su valor final (0 o 1). Cerramos en
-                    # libros a ese valor para no dejar la posición atascada ni
-                    # spamear errores; la redención on-chain realiza el P&L.
+                resolved = (
+                    reason == "RESOLVED"
+                    or exit_price <= RESOLVED_LO
+                    or exit_price >= RESOLVED_HI
+                )
+                if resolved:
+                    # Mercado resuelto de facto (precio en extremo) y a menudo
+                    # sin liquidez (0 bids → 'no match'): no se puede vender,
+                    # pero los outcome tokens se redimen on-chain a su valor
+                    # final (0 o 1). Cerramos en libros a ese valor para no
+                    # dejar la posición atascada; la redención on-chain realiza
+                    # el P&L. (Cubre también STOP_LOSS sobre un token colapsado,
+                    # cuyo SL salta antes que el chequeo de RESOLVED.)
                     exit_price = 1.0 if exit_price >= RESOLVED_HI else 0.0
+                    reason = "RESOLVED"
                 else:
-                    # SL/TP/COPY_EXIT con fallo transitorio (liquidez/capital):
-                    # 'no match' y 'not enough balance' son condiciones de
-                    # mercado esperadas, no fallos del sistema → sin Telegram.
+                    # Fallo transitorio en mercado vivo (liquidez/capital
+                    # puntual): 'no match' y 'not enough balance' son
+                    # condiciones esperadas, no fallos del sistema → sin
+                    # Telegram; se reintenta el próximo ciclo.
                     if "no match" not in msg and "not enough balance" not in msg:
                         self.notifier.notify_error(
                             f"sell_market {pos['question'][:50]}", msg
