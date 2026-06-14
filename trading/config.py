@@ -28,10 +28,15 @@ FUNDER_ADDRESS = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
 
 # Tipo de firma del CLOB:
 #   0 = EOA directa (fondos en tu dirección Phantom, requiere approvals manuales)
-#   1 = POLY_PROXY (cuentas creadas con email/Magic Link)
-#   2 = POLY_GNOSIS_SAFE (cuentas creadas conectando una wallet de navegador
-#       como Phantom/MetaMask en polymarket.com — el caso normal con Phantom)
-SIGNATURE_TYPE = int(os.environ.get("SIGNATURE_TYPE", "2"))
+#   1 = POLY_PROXY (cuentas creadas con email/Magic Link — legacy V1)
+#   2 = POLY_GNOSIS_SAFE (proxy Gnosis Safe — legacy V1)
+#   3 = POLY_1271 (EIP-1271, "deposit wallet flow" de CLOB V2). Tras la
+#       migración a V2 (28-abr-2026) las cuentas de wallet de navegador
+#       (Phantom/MetaMask) DEBEN usar 3: con 1/2 el CLOB devuelve balance 0 y
+#       rechaza las órdenes con "maker address not allowed, please use the
+#       deposit wallet flow". Verificado: con 3 el balance real aparece y los
+#       allowances están a max uint. El funder sigue siendo la dirección proxy.
+SIGNATURE_TYPE = int(os.environ.get("SIGNATURE_TYPE", "3"))
 
 # Gate de ejecución real. false => solo lectura/simulación.
 AUTO_EXECUTE = os.environ.get("AUTO_EXECUTE", "false").lower() == "true"
@@ -108,7 +113,7 @@ def assert_ready_for_live() -> None:
     missing = []
     if not PRIVATE_KEY:
         missing.append("POLYMARKET_PRIVATE_KEY")
-    if SIGNATURE_TYPE in (1, 2) and not FUNDER_ADDRESS:
+    if SIGNATURE_TYPE in (1, 2, 3) and not FUNDER_ADDRESS:
         missing.append("POLYMARKET_FUNDER_ADDRESS")
     if missing:
         raise RuntimeError(

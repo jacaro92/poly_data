@@ -43,7 +43,7 @@ class PolymarketExecutor:
             key=config.PRIVATE_KEY,
             chain_id=config.POLYGON_CHAIN_ID,
         )
-        if config.SIGNATURE_TYPE in (1, 2):
+        if config.SIGNATURE_TYPE in (1, 2, 3):
             kwargs["signature_type"] = config.SIGNATURE_TYPE
             kwargs["funder"] = config.FUNDER_ADDRESS
         self.client = ClobClient(**kwargs)
