@@ -29,6 +29,7 @@ TOP_WALLETS_CSV = os.path.join("processed", "top_wallets.csv")
 CURSOR_FILE = os.path.join("data", "cursor_state.json")
 FILLS_DIR = os.path.join("data", "fills")
 TRADES_DIR = os.path.join("processed", "trades")
+DATA_API = "https://data-api.polymarket.com"
 
 _session = requests.Session()
 _cache: dict = {}
@@ -61,6 +62,22 @@ def _midpoint(token_id: str) -> float | None:
 
 def _balance() -> dict | None:
     return _cached("balance", 120, lambda: proxy_balance(config.FUNDER_ADDRESS))
+
+
+def _positions_value() -> float | None:
+    """Valor de mercado de TODAS las posiciones en cartera, leído del data-api
+    de Polymarket (la misma fuente que su UI). Incluye tokens que cerramos en
+    libros pero seguimos teniendo (p.ej. polvo de mercados ilíquidos) y usa el
+    precio de marca de Polymarket → el valor de cartera cuadra 1:1 con su web."""
+    def fetch():
+        resp = _session.get(
+            f"{DATA_API}/positions", params={"user": config.FUNDER_ADDRESS}, timeout=10
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return round(sum(float(p.get("currentValue", 0) or 0) for p in (data or [])), 2)
+
+    return _cached("positions_value", 60, fetch)
 
 
 def _top_wallets(n: int = 10) -> list[dict]:
@@ -194,10 +211,16 @@ def build_state() -> dict:
     # pnl_total = valor_cartera - capital al pasar a LIVE.
     bal = _balance()
     cash = float((bal or {}).get("total_usd") or 0.0)
-    held_value = sum(
-        (p["size_usd"] + (p["pnl_usd"] or 0.0))
-        for p in open_pos if p.get("is_live")
-    )
+    # Valor de posiciones REAL desde el data-api de Polymarket (incluye todos
+    # los tokens en cartera, también el polvo que cerramos en libros, al precio
+    # de marca de Polymarket). Fallback a libros si el data-api no responde.
+    pos_value = _positions_value()
+    if pos_value is None:
+        pos_value = round(sum(
+            (p["size_usd"] + (p["pnl_usd"] or 0.0))
+            for p in open_pos if p.get("is_live")
+        ), 2)
+    held_value = pos_value
     portfolio_value = round(cash + held_value, 2)
     init_cap = config.INITIAL_CAPITAL_USD
     total_pnl = round(portfolio_value - init_cap, 2)
