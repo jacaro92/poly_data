@@ -156,10 +156,29 @@ def build_state() -> dict:
             }
         )
 
-    closed = state["closed"][::-1][:100]
-    realized = sum(p.get("pnl_usd", 0) for p in state["closed"])
-    wins = sum(1 for p in state["closed"] if p.get("pnl_usd", 0) >= 0)
-    n_closed = len(state["closed"])
+    closed_all = state["closed"]
+    closed = closed_all[::-1][:200]
+
+    def _totals(open_subset: list[dict], closed_subset: list[dict]) -> dict:
+        realized = sum(p.get("pnl_usd", 0) or 0 for p in closed_subset)
+        n_closed = len(closed_subset)
+        wins = sum(1 for p in closed_subset if (p.get("pnl_usd", 0) or 0) >= 0)
+        return {
+            "realized_pnl": round(realized, 2),
+            "n_closed": n_closed,
+            "win_rate": round(wins / n_closed, 4) if n_closed else None,
+            "n_open": len(open_subset),
+            "open_exposure": round(sum(p["size_usd"] for p in open_subset), 2),
+            "unrealized_pnl": round(
+                sum(p["pnl_usd"] for p in open_subset if p.get("pnl_usd") is not None), 2
+            ),
+        }
+
+    # Un cierre sin is_live es SIM antiguo (paper trading previo al go-live).
+    open_live = [p for p in open_pos if p.get("is_live")]
+    open_sim = [p for p in open_pos if not p.get("is_live")]
+    closed_live = [p for p in closed_all if p.get("is_live")]
+    closed_sim = [p for p in closed_all if not p.get("is_live")]
 
     return {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
@@ -176,15 +195,9 @@ def build_state() -> dict:
         "balance": _balance(),
         "open": open_pos,
         "closed": closed,
-        "totals": {
-            "realized_pnl": round(realized, 2),
-            "n_closed": n_closed,
-            "win_rate": round(wins / n_closed, 4) if n_closed else None,
-            "open_exposure": round(sum(p["size_usd"] for p in state["open"]), 2),
-            "unrealized_pnl": round(
-                sum(p["pnl_usd"] for p in open_pos if p["pnl_usd"] is not None), 2
-            ),
-        },
+        "totals": _totals(open_pos, closed_all),          # Todos (SIM+LIVE)
+        "totals_live": _totals(open_live, closed_live),   # solo órdenes reales
+        "totals_sim": _totals(open_sim, closed_sim),      # solo paper trading
         "wallets": _top_wallets(),
         "signals": state["signals"][::-1][:20],
         "pipeline": _pipeline_status(),
@@ -213,14 +226,23 @@ tr:last-child td{border-bottom:none}
 .pos{color:var(--green)} .neg{color:var(--red)}
 .badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600}
 .badge.live{background:#1f6f2e;color:#fff}.badge.sim{background:#6e5400;color:#fff}
+.toggle{display:inline-flex;gap:0;border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:16px}
+.toggle button{background:var(--card);color:var(--dim);border:none;padding:7px 16px;font:600 12px system-ui,sans-serif;cursor:pointer;border-left:1px solid var(--border)}
+.toggle button:first-child{border-left:none}
+.toggle button.on{background:var(--accent);color:#0d1117}
 a{color:var(--accent);text-decoration:none}
 .empty{color:var(--dim);padding:14px;background:var(--card);border:1px solid var(--border);border-radius:8px}
 </style></head><body>
 <h1>poly-trader <span id="mode" class="badge sim">…</span></h1>
 <div class="sub">Actualizado <span id="ts">…</span> · refresco cada 15 s</div>
+<div class="toggle" id="toggle">
+  <button data-m="live" class="on">LIVE (real)</button>
+  <button data-m="sim">SIM (paper)</button>
+  <button data-m="all">Todos</button>
+</div>
 <div class="cards" id="cards"></div>
-<h2>Posiciones abiertas</h2><div id="open"></div>
-<h2>Historial de cierres</h2><div id="closed"></div>
+<h2>Posiciones abiertas <span id="openScope" class="sub" style="text-transform:none"></span></h2><div id="open"></div>
+<h2>Historial de cierres <span id="closedScope" class="sub" style="text-transform:none"></span></h2><div id="closed"></div>
 <h2>Wallets seguidos (ranking)</h2><div id="wallets"></div>
 <h2>Últimas señales</h2><div id="signals"></div>
 <h2>Pipeline de datos</h2><div id="pipeline"></div>
@@ -235,21 +257,30 @@ function table(rows,cols){
   for(const r of rows)h+="<tr>"+cols.map(c=>`<td class="${c.c?c.c(r):""}">${c.f(r)}</td>`).join("")+"</tr>";
   return h+"</table>";
 }
-async function refresh(){
-  const s=await (await fetch("/api/state")).json();
+let MODE="live", LAST=null;
+async function refresh(){ LAST=await (await fetch("/api/state")).json(); render(); }
+function render(){
+  const s=LAST; if(!s)return;
   document.getElementById("ts").textContent=s.generated_at;
   const m=document.getElementById("mode");
   m.textContent=s.mode; m.className="badge "+s.mode.toLowerCase();
+  const g = MODE==="all" ? s.totals : s["totals_"+MODE];
   const bal=s.balance?s.balance.total_usd:null;
+  const onlyLive=MODE==="live", onlySim=MODE==="sim";
+  const flt=arr=>MODE==="all"?arr:arr.filter(r=>onlyLive?r.is_live:!r.is_live);
+  const openRows=flt(s.open), closedRows=flt(s.closed);
+  const scope=MODE==="all"?"(SIM + LIVE)":(onlyLive?"(solo órdenes reales)":"(solo paper trading)");
+  document.getElementById("openScope").textContent=`${scope} · ${g.n_open} abiertas`;
+  document.getElementById("closedScope").textContent=`${scope} · ${g.n_closed} cerradas`;
   document.getElementById("cards").innerHTML=[
-    ["Balance",fmt$(bal),""],
-    ["P&L realizado",fmt$(s.totals.realized_pnl),cls(s.totals.realized_pnl)],
-    ["P&L abierto",fmt$(s.totals.unrealized_pnl),cls(s.totals.unrealized_pnl)],
-    ["Exposición",fmt$(s.totals.open_exposure),""],
-    ["Win rate",fmtP(s.totals.win_rate),""],
-    ["Cierres",s.totals.n_closed,""],
+    ["Balance (wallet)",fmt$(bal),""],
+    ["P&L realizado",fmt$(g.realized_pnl),cls(g.realized_pnl)],
+    ["P&L abierto",fmt$(g.unrealized_pnl),cls(g.unrealized_pnl)],
+    ["Exposición",fmt$(g.open_exposure),""],
+    ["Win rate",fmtP(g.win_rate),""],
+    ["Cierres",g.n_closed,""],
   ].map(([l,v,c])=>`<div class="card"><div class="label">${l}</div><div class="value ${c}">${v}</div></div>`).join("");
-  document.getElementById("open").innerHTML=table(s.open,[
+  document.getElementById("open").innerHTML=table(openRows,[
     {h:"Mercado",f:r=>r.market_url?`<a href="${esc(r.market_url)}" target="_blank">${esc(r.question.slice(0,60))}</a>`:esc(r.question.slice(0,60))},
     {h:"Outcome",f:r=>esc(r.outcome)},
     {h:"Entrada",f:r=>r.entry_price.toFixed(3)},
@@ -260,7 +291,7 @@ async function refresh(){
     {h:"Abierta",f:r=>esc(r.opened_at)},
     {h:"Modo",f:r=>r.is_live?"LIVE":"SIM"},
   ]);
-  document.getElementById("closed").innerHTML=table(s.closed,[
+  document.getElementById("closed").innerHTML=table(closedRows,[
     {h:"Mercado",f:r=>esc(r.question.slice(0,60))},
     {h:"Entrada",f:r=>r.entry_price.toFixed(3)},
     {h:"Salida",f:r=>r.exit_price.toFixed(3)},
@@ -298,6 +329,12 @@ async function refresh(){
     </div>`+
     (preEvents?`<div class="sub" style="margin-top:8px">ℹ️ Los eventos OrderFilled empiezan en el bloque ~${p.events_from_block.toLocaleString()} (28-abr-2026). Hasta que el scan llegue ahí, trades/wallets/señales estarán vacíos — es lo esperado.</div>`:"");
 }
+document.getElementById("toggle").addEventListener("click",e=>{
+  const b=e.target.closest("button"); if(!b)return;
+  MODE=b.dataset.m;
+  [...document.querySelectorAll("#toggle button")].forEach(x=>x.classList.toggle("on",x===b));
+  render();
+});
 refresh(); setInterval(refresh,15000);
 </script></body></html>"""
 
