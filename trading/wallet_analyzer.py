@@ -139,7 +139,7 @@ def _compute_pnl(agg: pl.DataFrame) -> pl.DataFrame:
 
 
 def analyze(min_trades: int = 10, min_volume: float = 100.0) -> pl.DataFrame:
-    analyze_days = int(os.environ.get("WALLET_ANALYZE_DAYS", "7"))
+    analyze_days = int(os.environ.get("WALLET_ANALYZE_DAYS", "2"))
 
     all_files = sorted(
         os.path.join(TRADES_DIR, f)
