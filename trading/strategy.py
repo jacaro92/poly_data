@@ -53,6 +53,18 @@ RESOLVED_LO = 0.01
 _session = requests.Session()
 
 
+def _to_unix(s: str) -> int:
+    """'YYYY-MM-DD HH:MM:SS' (UTC) → epoch segundos. 0 si no parsea."""
+    try:
+        return int(
+            datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+    except Exception:
+        return 0
+
+
 # ── Fuentes de datos ──────────────────────────────────────────────────────────
 
 def followed_wallets() -> list[str]:
@@ -128,8 +140,79 @@ class CopyTrader:
         self.state = positions.load_state()
         if self.executor:
             self._close_stale_sim_positions()
+            self._revalidate_closed_pnl()
         self._balance_cache: tuple[float, float] = (0.0, 0.0)  # (ts, total)
         self._last_analyze = 0.0
+
+    def _revalidate_closed_pnl(self) -> None:
+        """Recalcula entrada/salida/P&L de las operaciones LIVE con los precios
+        de ejecución REALES (get_trades), corrigiendo las registradas con
+        midpoint (cierres con P&L $0.00, imposible: siempre se paga el spread)
+        y las entradas corruptas. Revalida cierres (entrada+salida) y posiciones
+        abiertas (entrada, para que su cierre futuro sea exacto). Idempotente:
+        marca cada operación con 'revalidated'."""
+        pend_closed = [p for p in self.state["closed"]
+                       if p.get("is_live") and not p.get("revalidated")]
+        pend_open = [p for p in self.state["open"]
+                     if p.get("is_live") and not p.get("revalidated")]
+        if not pend_closed and not pend_open:
+            return
+        try:
+            from py_clob_client_v2.clob_types import TradeParams
+            trades = self.executor.client.get_trades(TradeParams())
+        except Exception as e:
+            print(f"  revalidación: get_trades falló: {e}")
+            return
+
+        by_asset: dict[str, list[dict]] = {}
+        for t in trades:
+            by_asset.setdefault(str(t.get("asset_id")), []).append({
+                "side": t.get("side"),
+                "price": float(t.get("price", 0) or 0),
+                "size": float(t.get("size", 0) or 0),
+                "t": int(t.get("match_time", 0) or 0),
+            })
+
+        def vwap(fills, side, around, window=300):
+            sel = [f for f in fills
+                   if f["side"] == side and around and abs(f["t"] - around) <= window]
+            sz = sum(f["size"] for f in sel)
+            if sz <= 0:
+                return None, 0.0
+            return sum(f["price"] * f["size"] for f in sel) / sz, sz
+
+        def fix_entry(p) -> bool:
+            fills = by_asset.get(str(p.get("token_id")), [])
+            ep, bsz = vwap(fills, "BUY", _to_unix(p.get("opened_at", "")))
+            if ep is not None and bsz > 0:
+                p["entry_price"] = round(ep, 4)
+                p["shares"] = round(bsz, 4)
+                p["size_usd"] = round(ep * bsz, 2)
+                return True
+            return False
+
+        for p in pend_open:
+            fix_entry(p)
+            p["revalidated"] = True
+
+        n_fixed = 0
+        for p in pend_closed:
+            fix_entry(p)
+            fills = by_asset.get(str(p.get("token_id")), [])
+            xp, _ = vwap(fills, "SELL", _to_unix(p.get("closed_at", "")))
+            if xp is not None:
+                p["exit_price"] = round(xp, 4)
+            e, x, s = p.get("entry_price", 0.0), p.get("exit_price", 0.0), p.get("shares", 0.0)
+            if e > 0:
+                p["pnl_usd"] = round((x - e) * s, 2)
+                p["pnl_pct"] = round((x - e) / e, 4)
+            p["revalidated"] = True
+            n_fixed += 1
+        positions.save_state(self.state)
+        print(
+            f"  🔧 revalidados {n_fixed} cierres + {len(pend_open)} abiertas "
+            f"con precios reales (get_trades)"
+        )
 
     def _close_stale_sim_positions(self) -> None:
         """Al arrancar en LIVE, cierra (sin orden real) las posiciones SIM
