@@ -188,6 +188,28 @@ def build_state() -> dict:
             pts.append({"t": p.get("closed_at", ""), "cum": round(cum, 2)})
         return pts
 
+    # ── P&L REAL de cuenta (cruza con Polymarket) ───────────────────────────
+    # No usa los libros (que solo cuentan cierres): mark-to-market de la cuenta.
+    # valor_cartera = caja on-chain + valor actual de las posiciones abiertas;
+    # pnl_total = valor_cartera - capital al pasar a LIVE.
+    bal = _balance()
+    cash = float((bal or {}).get("total_usd") or 0.0)
+    held_value = sum(
+        (p["size_usd"] + (p["pnl_usd"] or 0.0))
+        for p in open_pos if p.get("is_live")
+    )
+    portfolio_value = round(cash + held_value, 2)
+    init_cap = config.INITIAL_CAPITAL_USD
+    total_pnl = round(portfolio_value - init_cap, 2)
+    account = {
+        "initial_capital": round(init_cap, 2),
+        "cash": round(cash, 2),
+        "held_value": round(held_value, 2),
+        "portfolio_value": portfolio_value,
+        "total_pnl": total_pnl,
+        "total_pnl_pct": round(total_pnl / init_cap, 4) if init_cap else None,
+    }
+
     return {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "mode": "LIVE" if config.AUTO_EXECUTE else "SIM",
@@ -200,7 +222,8 @@ def build_state() -> dict:
             "copy_top_n": config.COPY_TOP_N,
             "min_copy_usd": config.MIN_COPY_TRADE_USD,
         },
-        "balance": _balance(),
+        "balance": bal,
+        "account": account,
         "open": open_pos,
         "closed": closed,
         "totals": _totals(open_pos, closed_all),          # Todos (SIM+LIVE)
@@ -246,6 +269,9 @@ a{color:var(--accent);text-decoration:none}
 </style></head><body>
 <h1>poly-trader <span id="mode" class="badge sim">…</span></h1>
 <div class="sub">Actualizado <span id="ts">…</span> · refresco cada 15 s</div>
+<h2>Cuenta real <span class="sub" style="text-transform:none">(mark-to-market, cruza con Polymarket)</span></h2>
+<div class="cards" id="account"></div>
+<h2 style="margin-top:24px">Por modo</h2>
 <div class="toggle" id="toggle">
   <button data-m="live" class="on">LIVE (real)</button>
   <button data-m="sim">SIM (paper)</button>
@@ -296,6 +322,15 @@ function render(){
   document.getElementById("ts").textContent=s.generated_at;
   const m=document.getElementById("mode");
   m.textContent=s.mode; m.className="badge "+s.mode.toLowerCase();
+  const a=s.account||{};
+  document.getElementById("account").innerHTML=[
+    ["Valor cartera",fmt$(a.portfolio_value),""],
+    ["P&L total (vs inicio)",fmt$(a.total_pnl),cls(a.total_pnl)],
+    ["Rendimiento",fmtP(a.total_pnl_pct),cls(a.total_pnl)],
+    ["Caja disponible",fmt$(a.cash),""],
+    ["En posiciones",fmt$(a.held_value),""],
+    ["Capital inicial",fmt$(a.initial_capital),""],
+  ].map(([l,v,c])=>`<div class="card"><div class="label">${l}</div><div class="value ${c}">${v}</div></div>`).join("");
   const g = MODE==="all" ? s.totals : s["totals_"+MODE];
   const bal=s.balance?s.balance.total_usd:null;
   const onlyLive=MODE==="live", onlySim=MODE==="sim";

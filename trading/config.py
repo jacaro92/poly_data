@@ -41,6 +41,13 @@ SIGNATURE_TYPE = int(os.environ.get("SIGNATURE_TYPE", "3"))
 # Gate de ejecución real. false => solo lectura/simulación.
 AUTO_EXECUTE = os.environ.get("AUTO_EXECUTE", "false").lower() == "true"
 
+# Capital al pasar a LIVE. Sirve para el P&L REAL de cuenta del dashboard:
+# pnl_total = (caja + valor de posiciones abiertas) - INITIAL_CAPITAL_USD.
+# Esta métrica cruza con la "Cartera" de Polymarket (mark-to-market), a
+# diferencia del P&L realizado por libros (solo cierres). Ajustar por entorno
+# si se deposita/retira.
+INITIAL_CAPITAL_USD = float(os.environ.get("INITIAL_CAPITAL_USD", "14.96"))
+
 # ── Telegram notifications ──────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
