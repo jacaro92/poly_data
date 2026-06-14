@@ -179,6 +179,7 @@ class CopyTrader:
         usd = float(trade.get("size", 0) or 0) * price
         question = trade.get("title", "") or token_id
 
+        # Filtros baratos primero (sin llamadas de red).
         skip = None
         if usd < config.MIN_COPY_TRADE_USD:
             skip = f"trade ${usd:.0f} < umbral ${config.MIN_COPY_TRADE_USD:.0f}"
@@ -188,6 +189,20 @@ class CopyTrader:
             skip = "ya en posición"
         elif len(self.state["open"]) >= config.MAX_OPEN_POSITIONS:
             skip = f"límite de {config.MAX_OPEN_POSITIONS} posiciones"
+
+        # Precio real de entrada = midpoint actual (el del wallet seguido puede
+        # llevar segundos de retraso). Revalidar el rango con el midpoint evita
+        # comprar tokens muertos/ilíquidos cuyo precio ya colapsó a ~0 o ~1:
+        # no se podrían vender después ('no match', sin bids) y quedarían
+        # atascados. Solo se consulta si los filtros baratos pasaron.
+        entry = price
+        if not skip:
+            entry = midpoint(token_id) or price
+            size_usd = config.compute_size(self.balance())
+            if not (config.ENTRY_PRICE_MIN <= entry <= config.ENTRY_PRICE_MAX):
+                skip = f"entrada {entry:.3f} fuera de [{config.ENTRY_PRICE_MIN}, {config.ENTRY_PRICE_MAX}]"
+            elif config.AUTO_EXECUTE and self.balance() < size_usd:
+                skip = f"balance ${self.balance():.2f} < tamaño ${size_usd:.2f}"
 
         positions.log_signal(
             self.state,
@@ -205,13 +220,6 @@ class CopyTrader:
             return
 
         size_usd = config.compute_size(self.balance())
-        if config.AUTO_EXECUTE and self.balance() < size_usd:
-            print(f"  ⏭ balance ${self.balance():.2f} < tamaño ${size_usd:.2f}")
-            return
-
-        # Entrada al precio actual (midpoint), no al precio del wallet seguido,
-        # que puede tener varios segundos de retraso.
-        entry = midpoint(token_id) or price
         url = market_url(trade)
 
         if self.executor:
@@ -259,9 +267,24 @@ class CopyTrader:
                     entry_price=pos["entry_price"], reason=reason,
                 )
             except Exception as e:
-                print(f"  ✗ venta falló ({reason}): {e}")
-                self.notifier.notify_error(f"sell_market {pos['question'][:50]}", str(e))
-                return  # mantener abierta; se reintenta el próximo ciclo
+                msg = str(e)
+                print(f"  ✗ venta falló ({reason}): {msg}")
+                if reason == "RESOLVED":
+                    # Mercado resuelto: a menudo sin liquidez (0 bids → 'no
+                    # match'). No se puede vender, pero los outcome tokens se
+                    # redimen on-chain a su valor final (0 o 1). Cerramos en
+                    # libros a ese valor para no dejar la posición atascada ni
+                    # spamear errores; la redención on-chain realiza el P&L.
+                    exit_price = 1.0 if exit_price >= RESOLVED_HI else 0.0
+                else:
+                    # SL/TP/COPY_EXIT con fallo transitorio (liquidez/capital):
+                    # 'no match' y 'not enough balance' son condiciones de
+                    # mercado esperadas, no fallos del sistema → sin Telegram.
+                    if "no match" not in msg and "not enough balance" not in msg:
+                        self.notifier.notify_error(
+                            f"sell_market {pos['question'][:50]}", msg
+                        )
+                    return  # mantener abierta; se reintenta el próximo ciclo
         else:
             self.notifier.notify_trade_closed(
                 question=pos["question"], direction="BUY_YES",

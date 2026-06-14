@@ -180,6 +180,14 @@ def build_state() -> dict:
     closed_live = [p for p in closed_all if p.get("is_live")]
     closed_sim = [p for p in closed_all if not p.get("is_live")]
 
+    def _equity(closed_subset: list[dict]) -> list[dict]:
+        """Curva de P&L acumulado: cierres ordenados por fecha con suma corrida."""
+        pts, cum = [], 0.0
+        for p in sorted(closed_subset, key=lambda x: x.get("closed_at", "")):
+            cum += p.get("pnl_usd", 0) or 0
+            pts.append({"t": p.get("closed_at", ""), "cum": round(cum, 2)})
+        return pts
+
     return {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "mode": "LIVE" if config.AUTO_EXECUTE else "SIM",
@@ -198,6 +206,9 @@ def build_state() -> dict:
         "totals": _totals(open_pos, closed_all),          # Todos (SIM+LIVE)
         "totals_live": _totals(open_live, closed_live),   # solo órdenes reales
         "totals_sim": _totals(open_sim, closed_sim),      # solo paper trading
+        "equity_live": _equity(closed_live),
+        "equity_sim": _equity(closed_sim),
+        "equity_all": _equity(closed_all),
         "wallets": _top_wallets(),
         "signals": state["signals"][::-1][:20],
         "pipeline": _pipeline_status(),
@@ -241,6 +252,8 @@ a{color:var(--accent);text-decoration:none}
   <button data-m="all">Todos</button>
 </div>
 <div class="cards" id="cards"></div>
+<h2>Curva de P&amp;L acumulado <span id="equityScope" class="sub" style="text-transform:none"></span></h2>
+<div id="equity" class="card" style="padding:16px"></div>
 <h2>Posiciones abiertas <span id="openScope" class="sub" style="text-transform:none"></span></h2><div id="open"></div>
 <h2>Historial de cierres <span id="closedScope" class="sub" style="text-transform:none"></span></h2><div id="closed"></div>
 <h2>Wallets seguidos (ranking)</h2><div id="wallets"></div>
@@ -256,6 +269,25 @@ function table(rows,cols){
   let h="<table><tr>"+cols.map(c=>`<th>${c.h}</th>`).join("")+"</tr>";
   for(const r of rows)h+="<tr>"+cols.map(c=>`<td class="${c.c?c.c(r):""}">${c.f(r)}</td>`).join("")+"</tr>";
   return h+"</table>";
+}
+function drawEquity(pts){
+  if(!pts||!pts.length)return '<div class="empty">— sin cierres todavía —</div>';
+  const W=800,H=220,pad=34;
+  const ys=pts.map(p=>p.cum).concat([0]);
+  let mn=Math.min(...ys),mx=Math.max(...ys); if(mn===mx){mn-=1;mx+=1;}
+  const n=pts.length;
+  const X=i=>n===1?W/2:pad+i*(W-2*pad)/(n-1);
+  const Y=v=>H-pad-(v-mn)*(H-2*pad)/(mx-mn);
+  const pl=pts.map((p,i)=>`${X(i).toFixed(1)},${Y(p.cum).toFixed(1)}`).join(" ");
+  const last=pts[n-1].cum, color=last>=0?"var(--green)":"var(--red)", zy=Y(0).toFixed(1);
+  const dots=pts.map((p,i)=>`<circle cx="${X(i).toFixed(1)}" cy="${Y(p.cum).toFixed(1)}" r="2.5" fill="${color}"><title>${esc(p.t)}: ${fmt$(p.cum)}</title></circle>`).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet" style="font:11px system-ui">
+    <line x1="${pad}" y1="${zy}" x2="${W-pad}" y2="${zy}" stroke="var(--border)" stroke-dasharray="4 4"/>
+    <text x="${pad-4}" y="${(+zy+4)}" fill="var(--dim)" text-anchor="end">0</text>
+    <polyline fill="none" stroke="${color}" stroke-width="2" points="${pl}"/>${dots}
+    <text x="${W-pad}" y="${Math.max(14,Y(last)-8).toFixed(1)}" fill="${color}" text-anchor="end" font-weight="600">${fmt$(last)}</text>
+    <text x="${pad}" y="14" fill="var(--dim)">máx ${fmt$(mx)} · mín ${fmt$(mn)} · ${n} cierre${n!==1?"s":""}</text>
+  </svg>`;
 }
 let MODE="live", LAST=null;
 async function refresh(){ LAST=await (await fetch("/api/state")).json(); render(); }
@@ -280,6 +312,9 @@ function render(){
     ["Win rate",fmtP(g.win_rate),""],
     ["Cierres",g.n_closed,""],
   ].map(([l,v,c])=>`<div class="card"><div class="label">${l}</div><div class="value ${c}">${v}</div></div>`).join("");
+  const eq = MODE==="all" ? s.equity_all : s["equity_"+MODE];
+  document.getElementById("equity").innerHTML=drawEquity(eq);
+  document.getElementById("equityScope").textContent=scope;
   document.getElementById("open").innerHTML=table(openRows,[
     {h:"Mercado",f:r=>r.market_url?`<a href="${esc(r.market_url)}" target="_blank">${esc(r.question.slice(0,60))}</a>`:esc(r.question.slice(0,60))},
     {h:"Outcome",f:r=>esc(r.outcome)},
