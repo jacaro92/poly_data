@@ -24,7 +24,9 @@ dev = [
     "ipykernel>=6.25.0",
 ]
 trading = [
-    "py-clob-client>=0.17.0",
+    # CLOB V2: el paquete viejo py-clob-client quedó obsoleto tras la migración
+    # del 28-abr-2026 (EIP-712 domain version 1→2 → "invalid order version").
+    "py-clob-client-v2>=1.0.1",
 ]
 
 [build-system]

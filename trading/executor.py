@@ -17,13 +17,15 @@ Las funciones de solo lectura (balance, midpoint, open_orders) funcionan
 siempre; las que envían órdenes exigen AUTO_EXECUTE=true.
 """
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
-    MarketOrderArgs,
-    OrderArgs,
+# CLOB V2 (Polymarket migró el dominio EIP-712 de "1" a "2" el 28-abr-2026;
+# el paquete viejo py-clob-client quedó obsoleto → "invalid order version").
+from py_clob_client_v2 import ClobClient
+from py_clob_client_v2.clob_types import (
+    MarketOrderArgsV2,
+    OrderArgsV2,
     OrderType,
 )
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client_v2.order_builder.constants import BUY, SELL
 
 from trading import config
 from trading.telegram_notifier import TelegramNotifier
@@ -45,7 +47,7 @@ class PolymarketExecutor:
             kwargs["signature_type"] = config.SIGNATURE_TYPE
             kwargs["funder"] = config.FUNDER_ADDRESS
         self.client = ClobClient(**kwargs)
-        self.client.set_api_creds(self.client.create_or_derive_api_creds())
+        self.client.set_api_creds(self.client.create_or_derive_api_key())
         self.notifier = TelegramNotifier()
 
     # ── Solo lectura ──────────────────────────────────────────────────────────
@@ -64,11 +66,22 @@ class PolymarketExecutor:
     def midpoint(self, token_id: str) -> dict:
         return self.client.get_midpoint(token_id)
 
+    def _midpoint_price(self, token_id: str) -> float:
+        """Precio medio como float, tolerante a fallos/formatos (solo para
+        notificaciones; nunca debe romper una orden ya enviada)."""
+        try:
+            mid = self.client.get_midpoint(token_id)
+            if isinstance(mid, dict):
+                mid = mid.get("mid", 0.0)
+            return float(mid)
+        except Exception:
+            return 0.0
+
     def order_book(self, token_id: str):
         return self.client.get_order_book(token_id)
 
     def open_orders(self):
-        return self.client.get_orders()
+        return self.client.get_open_orders()
 
     def check_sl_tp(
         self,
@@ -110,7 +123,7 @@ class PolymarketExecutor:
         """Orden límite de compra: `size` shares a `price` (0-1)."""
         self._guard()
         order = self.client.create_order(
-            OrderArgs(token_id=token_id, price=price, size=size, side=BUY)
+            OrderArgsV2(token_id=token_id, price=price, size=size, side=BUY)
         )
         result = self.client.post_order(order, OrderType.GTC)
         self.notifier.notify_trade_opened(
@@ -135,7 +148,7 @@ class PolymarketExecutor:
     ):
         self._guard()
         order = self.client.create_order(
-            OrderArgs(token_id=token_id, price=price, size=size, side=SELL)
+            OrderArgsV2(token_id=token_id, price=price, size=size, side=SELL)
         )
         result = self.client.post_order(order, OrderType.GTC)
         if question and entry_price > 0:
@@ -160,10 +173,10 @@ class PolymarketExecutor:
         """Orden a mercado: gasta `usd_amount` USDC en el token (FOK)."""
         self._guard()
         order = self.client.create_market_order(
-            MarketOrderArgs(token_id=token_id, amount=usd_amount, side=BUY)
+            MarketOrderArgsV2(token_id=token_id, amount=usd_amount, side=BUY)
         )
         result = self.client.post_order(order, OrderType.FOK)
-        mid = self.midpoint(token_id).get("mid", 0.0)
+        mid = self._midpoint_price(token_id)
         self.notifier.notify_trade_opened(
             question=question or token_id,
             direction="BUY_YES",
@@ -185,11 +198,11 @@ class PolymarketExecutor:
     ):
         self._guard()
         order = self.client.create_market_order(
-            MarketOrderArgs(token_id=token_id, amount=shares, side=SELL)
+            MarketOrderArgsV2(token_id=token_id, amount=shares, side=SELL)
         )
         result = self.client.post_order(order, OrderType.FOK)
         if question and entry_price > 0:
-            mid = self.midpoint(token_id).get("mid", 0.0)
+            mid = self._midpoint_price(token_id)
             self.notifier.notify_trade_closed(
                 question=question,
                 direction="BUY_YES",

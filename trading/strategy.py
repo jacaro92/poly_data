@@ -108,8 +108,23 @@ class CopyTrader:
             from trading.executor import PolymarketExecutor
             self.executor = PolymarketExecutor()
         self.state = positions.load_state()
+        if self.executor:
+            self._close_stale_sim_positions()
         self._balance_cache: tuple[float, float] = (0.0, 0.0)  # (ts, total)
         self._last_analyze = 0.0
+
+    def _close_stale_sim_positions(self) -> None:
+        """Al arrancar en LIVE, cierra (sin orden real) las posiciones SIM
+        (is_live=false) que quedaran abiertas de la fase de paper trading: no
+        deben ocupar slots de MAX_OPEN_POSITIONS ni gestionarse como reales."""
+        stale = [p for p in self.state["open"] if not p.get("is_live")]
+        for pos in stale:
+            positions.close_position(
+                self.state, pos, pos.get("entry_price", 0.0), "SIM_CLEANUP"
+            )
+            print(f"  🧹 SIM cerrada (cleanup live): {pos['question'][:50]}")
+        if stale:
+            print(f"  🧹 {len(stale)} posición(es) SIM cerradas; slots liberados")
 
     def maybe_refresh_wallets(self) -> None:
         """Regenera el ranking de wallets cada WALLET_REFRESH_HOURS cuando hay
