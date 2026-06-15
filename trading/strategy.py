@@ -105,6 +105,37 @@ def midpoint(token_id: str) -> float | None:
         return None
 
 
+# Caché de fechas de cierre por conditionId (no cambian; evita repetir la
+# llamada al CLOB en cada ciclo para el mismo mercado).
+_enddate_cache: dict[str, datetime | None] = {}
+
+
+def market_end_date(condition_id: str) -> datetime | None:
+    """Fecha de resolución (end_date_iso) del mercado via CLOB público.
+
+    Devuelve None si no se puede determinar (sin condition_id, fallo de red o
+    el mercado no expone fecha). Cachea el resultado por conditionId."""
+    if not condition_id:
+        return None
+    if condition_id in _enddate_cache:
+        return _enddate_cache[condition_id]
+    end = None
+    try:
+        resp = _session.get(
+            f"{config.CLOB_HOST}/markets/{condition_id}", timeout=10
+        )
+        resp.raise_for_status()
+        iso = resp.json().get("end_date_iso")
+        if iso:
+            end = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+    except Exception:
+        end = None
+    _enddate_cache[condition_id] = end
+    return end
+
+
 def best_bid_ask(token_id: str) -> tuple[float | None, float | None]:
     """(mejor_bid, mejor_ask) del libro público del CLOB. (None, None) si falla
     o el libro está vacío de ese lado. Para medir el spread antes de entrar."""
@@ -297,6 +328,20 @@ class CopyTrader:
         # no se podrían vender después ('no match', sin bids) y quedarían
         # atascados. Solo se consulta si los filtros baratos pasaron.
         entry = price
+        if not skip:
+            # Ventana de resolución: solo mercados que resuelven pronto. Evita
+            # entrar en colas largas (geopolítica a 45 días) donde el capital
+            # queda atrapado y el TIME_EXIT cierra al midpoint con pérdida.
+            if config.MAX_RESOLUTION_HOURS > 0:
+                end = market_end_date(str(trade.get("conditionId", "")))
+                if end is not None:
+                    hours_left = (end - datetime.now(timezone.utc)).total_seconds() / 3600
+                    if hours_left > config.MAX_RESOLUTION_HOURS:
+                        skip = (
+                            f"resuelve en {hours_left:.0f}h > "
+                            f"{config.MAX_RESOLUTION_HOURS:.0f}h (ventana larga)"
+                        )
+
         if not skip:
             entry = midpoint(token_id) or price
             size_usd = config.compute_size(self.balance())

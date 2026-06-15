@@ -170,6 +170,14 @@ def analyze(min_trades: int = 10, min_volume: float = 100.0) -> pl.DataFrame:
     max_trades = int(os.environ.get("MAX_WALLET_TRADES", "20000"))
     max_win_rate = float(os.environ.get("MAX_WALLET_WIN_RATE", "0.99"))
 
+    # Ranking por ÉXITO, no por P&L bruto. El P&L realizado absoluto favorece a
+    # wallets de mucho volumen (pueden ganar $1000 con ROI 1% y win_rate 50%);
+    # copiarlos con $2.5/trade no hereda su rentabilidad. El score premia:
+    #   - roi      : rentabilidad por dólar arriesgado (eficiencia direccional).
+    #   - win_rate : consistencia de acertar (no un par de pelotazos).
+    #   - log1p(closed_lots): confianza por tamaño de muestra (rendimientos
+    #     decrecientes; no premiar volumen sin límite como el P&L bruto).
+    # roi<0 ó win_rate bajo → score negativo/bajo → fondo del ranking.
     ranking = (
         wallet_stats
         .with_columns([
@@ -184,18 +192,26 @@ def analyze(min_trades: int = 10, min_volume: float = 100.0) -> pl.DataFrame:
             & (pl.col("win_rate") <= max_win_rate)      # excluye arb perfecto
         )
         .with_columns([
+            (pl.col("roi") * pl.col("win_rate")
+             * (pl.col("closed_lots") + 1).log()).alias("score"),
+        ])
+        .with_columns([
             pl.col("realized_pnl").round(2),
             pl.col("volume_buy").round(2),
+            pl.col("roi").round(4),
+            pl.col("win_rate").round(4),
+            pl.col("score").round(4),
         ])
-        .sort("realized_pnl", descending=True)
+        .sort("score", descending=True)
         .select([
-            "wallet", "realized_pnl", "roi", "win_rate",
-            "closed_lots", "n_trades", "volume_buy",
+            "wallet", "score", "roi", "win_rate",
+            "realized_pnl", "closed_lots", "n_trades", "volume_buy",
         ])
     )
     print(
         f"  Filtro wallets: lots>={min_lots}, trades<={max_trades}, "
-        f"win_rate<={max_win_rate} → {len(ranking)} copiables"
+        f"win_rate<={max_win_rate} → {len(ranking)} copiables "
+        f"(ordenados por score = roi×win_rate×log1p(lots))"
     )
 
     if ranking.is_empty():
