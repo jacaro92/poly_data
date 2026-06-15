@@ -102,6 +102,18 @@ MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "3"))
 ENTRY_PRICE_MIN = float(os.environ.get("ENTRY_PRICE_MIN", "0.10"))
 ENTRY_PRICE_MAX = float(os.environ.get("ENTRY_PRICE_MAX", "0.90"))
 
+# ── Diversificación / anti-correlación ──────────────────────────────────────
+# Evita sobre-exponer la cartera a una sola apuesta. El daño de junio fue tener
+# 9/10 posiciones del MISMO wallet y del MISMO evento (los varios candidatos a
+# "firmar el acuerdo Irán" son un único evento desglosado → correlación total):
+# si la narrativa se mueve en contra, caen todas juntas y el ranking de wallets
+# no sirve de nada.
+#   MAX_POS_PER_WALLET: máx posiciones abiertas copiadas del mismo source_wallet.
+#   MAX_POS_PER_EVENT : máx posiciones abiertas en el mismo evento (eventSlug).
+# 0 = sin límite.
+MAX_POS_PER_WALLET = int(os.environ.get("MAX_POS_PER_WALLET", "2"))
+MAX_POS_PER_EVENT = int(os.environ.get("MAX_POS_PER_EVENT", "2"))
+
 # Salidas adicionales a SL/TP:
 #   COPY_EXIT: cerrar cuando el wallet seguido vende el mismo token.
 #   MAX_HOLD_HOURS: cierre por tiempo (0 = sin límite).

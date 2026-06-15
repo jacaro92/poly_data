@@ -310,6 +310,7 @@ class CopyTrader:
         price = float(trade.get("price", 0) or 0)
         usd = float(trade.get("size", 0) or 0) * price
         question = trade.get("title", "") or token_id
+        event_slug = trade.get("eventSlug") or trade.get("slug") or ""
 
         # Filtros baratos primero (sin llamadas de red).
         skip = None
@@ -321,6 +322,13 @@ class CopyTrader:
             skip = "ya en posición"
         elif len(self.state["open"]) >= config.MAX_OPEN_POSITIONS:
             skip = f"límite de {config.MAX_OPEN_POSITIONS} posiciones"
+        # Anti-correlación: no amontonar la cartera en un solo wallet/evento.
+        elif (config.MAX_POS_PER_WALLET > 0
+              and positions.count_open_by_wallet(self.state, wallet) >= config.MAX_POS_PER_WALLET):
+            skip = f"ya {config.MAX_POS_PER_WALLET} pos del wallet {wallet[:10]}… (diversificar)"
+        elif (config.MAX_POS_PER_EVENT > 0 and event_slug
+              and positions.count_open_by_event(self.state, event_slug) >= config.MAX_POS_PER_EVENT):
+            skip = f"ya {config.MAX_POS_PER_EVENT} pos en evento '{event_slug[:30]}' (correlación)"
 
         # Precio real de entrada = midpoint actual (el del wallet seguido puede
         # llevar segundos de retraso). Revalidar el rango con el midpoint evita
@@ -413,6 +421,7 @@ class CopyTrader:
             source_wallet=wallet,
             market_url=url,
             is_live=bool(self.executor),
+            event_slug=event_slug,
         )
         mode = "LIVE" if self.executor else "SIM"
         print(f"  🟢 [{mode}] COPIA {question[:50]} @ {entry:.3f}  ${size_usd:.2f}  (de {wallet[:10]}…)")

@@ -61,6 +61,7 @@ def open_position(
     source_wallet: str,
     market_url: str = "",
     is_live: bool = False,
+    event_slug: str = "",
 ) -> dict:
     pos = {
         "id": uuid.uuid4().hex[:12],
@@ -72,6 +73,7 @@ def open_position(
         "shares": round(size_usd / entry_price, 4) if entry_price > 0 else 0.0,
         "source_wallet": source_wallet,
         "market_url": market_url,
+        "event_slug": event_slug or _event_of_url(market_url),
         "is_live": is_live,
         "opened_at": _now_iso(),
     }
@@ -108,3 +110,28 @@ def log_signal(state: dict, signal: dict) -> None:
 
 def has_open_token(state: dict, token_id: str) -> bool:
     return any(p["token_id"] == token_id for p in state["open"])
+
+
+def _event_of_url(market_url: str) -> str:
+    """Slug del evento desde la URL (…/event/<slug>). '' si no aplica."""
+    return market_url.rstrip("/").rsplit("/", 1)[-1] if market_url else ""
+
+
+def _event_of(pos: dict) -> str:
+    """Evento de una posición (event_slug guardado, o derivado de market_url
+    para posiciones antiguas sin el campo)."""
+    return pos.get("event_slug") or _event_of_url(pos.get("market_url", ""))
+
+
+def count_open_by_wallet(state: dict, wallet: str) -> int:
+    """Posiciones abiertas copiadas del mismo wallet fuente."""
+    w = (wallet or "").lower()
+    return sum(1 for p in state["open"] if (p.get("source_wallet") or "").lower() == w)
+
+
+def count_open_by_event(state: dict, event_slug: str) -> int:
+    """Posiciones abiertas en el mismo evento (mercados correlacionados:
+    p.ej. los varios candidatos a 'firmar el acuerdo' son un solo evento)."""
+    if not event_slug:
+        return 0
+    return sum(1 for p in state["open"] if _event_of(p) == event_slug)
