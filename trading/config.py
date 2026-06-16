@@ -81,6 +81,18 @@ COPY_TOP_N = int(os.environ.get("COPY_TOP_N", "5"))
 # Filtra el ruido de micro-trades y rebalanceos.
 MIN_COPY_TRADE_USD = float(os.environ.get("MIN_COPY_TRADE_USD", "50.0"))
 
+# ── Exclusión de tipos de mercado degenerados ───────────────────────────────
+# Patrones (substrings, lower-case) que, si aparecen en el slug o el título,
+# descartan la entrada. Por defecto las velas cripto "Up or Down" de 5 min:
+# son una moneda al aire (≈50/50), copiar con retraso paga spread (EV<0) y
+# resuelven más rápido (5 min) que el poll de la estrategia (30s) → el SL no
+# llega a cortar y se vende a ~0 (pérdidas de −$2 en vez de −$0.5). Coma-sep.
+EXCLUDE_MARKET_PATTERNS = [
+    p.strip().lower()
+    for p in os.environ.get("EXCLUDE_MARKET_PATTERNS", "updown,up or down").split(",")
+    if p.strip()
+]
+
 # ── Filtro de calidad de wallets (wallet_analyzer) ──────────────────────────
 # Excluye del ranking wallets NO copiables con retraso:
 #   - Market-makers / bots HFT: nº de acciones disparatado (ganan por spread y

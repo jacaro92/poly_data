@@ -314,7 +314,11 @@ class CopyTrader:
 
         # Filtros baratos primero (sin llamadas de red).
         skip = None
-        if usd < config.MIN_COPY_TRADE_USD:
+        hay = f"{question} {event_slug} {trade.get('slug','')}".lower()
+        bad = next((p for p in config.EXCLUDE_MARKET_PATTERNS if p in hay), None)
+        if bad:
+            skip = f"tipo de mercado excluido ('{bad}')"
+        elif usd < config.MIN_COPY_TRADE_USD:
             skip = f"trade ${usd:.0f} < umbral ${config.MIN_COPY_TRADE_USD:.0f}"
         elif not (config.ENTRY_PRICE_MIN <= price <= config.ENTRY_PRICE_MAX):
             skip = f"precio {price:.2f} fuera de [{config.ENTRY_PRICE_MIN}, {config.ENTRY_PRICE_MAX}]"
