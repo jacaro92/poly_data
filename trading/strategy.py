@@ -13,12 +13,19 @@ REGLAS DE ENTRADA — se copia una compra del wallet seguido si:
   5. Posiciones abiertas < MAX_OPEN_POSITIONS.
   6. Balance disponible >= tamaño a invertir (solo en live).
 
-REGLAS DE SALIDA — se cierra una posición cuando ocurre lo primero de:
-  1. STOP_LOSS_PCT  : el token cae ese % desde la entrada.
-  2. TAKE_PROFIT_PCT: el token sube ese % desde la entrada.
-  3. COPY_EXIT      : el wallet seguido vende ese mismo token.
-  4. RESOLVED       : precio >= 0.99 o <= 0.01 (mercado decidido de facto).
-  5. TIME_EXIT      : la posición supera MAX_HOLD_HOURS.
+REGLAS DE SALIDA — se cierra una posición cuando ocurre lo primero de (en este
+orden de prioridad, validado con el histórico LIVE):
+  1. STOP_LOSS   : el token cae STOP_LOSS_PCT desde la entrada (suelo duro;
+                   ancho WIDE_STOP_LOSS_PCT en spreads/hándicaps de alta varianza).
+  2. COPY_EXIT   : el wallet seguido vende ese mismo token (la mejor salida del
+                   histórico: anticipa los desplomes).
+  3. RESOLVED    : precio >= 0.99 o <= 0.01 (mercado decidido de facto).
+  4. TRAIL_TP    : take-profit dinámico (retrocede TRAILING_TP_PCT desde el
+                   máximo, tras armarse en +TRAILING_TP_ARM). Deja correr ganadores.
+  5. TAKE_PROFIT : TP fijo legacy (TAKE_PROFIT_PCT; 0 = desactivado).
+  6. TIME_EXIT   : la posición supera MAX_HOLD_HOURS.
+
+Cierre manual fuera de banda: data/force_close.json (lo procesa el trader).
 
 MODOS:
   AUTO_EXECUTE=false → paper trading: registra posiciones simuladas en
@@ -29,6 +36,7 @@ Uso: python -m trading.strategy   (servicio poly-trader en docker-compose)
 """
 
 import csv
+import json
 import os
 import sys
 import time
@@ -49,6 +57,13 @@ TRADES_DIR = os.path.join("processed", "trades")
 # Precio extremo = mercado decidido de facto.
 RESOLVED_HI = 0.99
 RESOLVED_LO = 0.01
+
+# Cierre manual fuera de banda: el trader (único escritor de positions.json) lee
+# este fichero al inicio de cada ciclo y cierra en real las posiciones que
+# coincidan (por id o por source_wallet), con reason MANUAL_CLOSE. Editar
+# positions.json a mano no sirve: el trader lo reescribe desde su estado en
+# memoria. {"ids": [...], "wallets": [...]}.
+FORCE_CLOSE_FILE = os.path.join("data", "force_close.json")
 
 _session = requests.Session()
 
@@ -293,15 +308,15 @@ class CopyTrader:
             print(f"  ! balance no disponible: {e}")
         return self._balance_cache[1]
 
-    def check_sl_tp(self, entry: float, current: float) -> str | None:
-        if entry <= 0:
-            return None
-        change = (current - entry) / entry
-        if config.STOP_LOSS_PCT > 0 and change <= -config.STOP_LOSS_PCT:
-            return "STOP_LOSS"
-        if config.TAKE_PROFIT_PCT > 0 and change >= config.TAKE_PROFIT_PCT:
-            return "TAKE_PROFIT"
-        return None
+    def _stop_loss_pct(self, question: str) -> float:
+        """SL aplicable a un mercado. Los de alta varianza (spreads/hándicaps,
+        WIDE_SL_PATTERNS) usan WIDE_STOP_LOSS_PCT si está configurado; el resto,
+        STOP_LOSS_PCT."""
+        if config.WIDE_STOP_LOSS_PCT > 0 and config.WIDE_SL_PATTERNS:
+            hay = (question or "").lower()
+            if any(p in hay for p in config.WIDE_SL_PATTERNS):
+                return config.WIDE_STOP_LOSS_PCT
+        return config.STOP_LOSS_PCT
 
     # ── entradas ──
 
@@ -486,18 +501,43 @@ class CopyTrader:
         )
 
     def check_exits(self, sells_by_token: dict[str, str]) -> None:
+        # Prioridad de salidas (validada con el histórico LIVE):
+        #   1. STOP_LOSS   — suelo duro; ancho en spreads/hándicaps (alta varianza).
+        #   2. COPY_EXIT   — seguir al wallet: la mejor salida del histórico
+        #                    (+$0.14 realizado vs −$7.33 aguantando a resolución).
+        #   3. RESOLVED    — mercado decidido de facto (≥0.99 / ≤0.01).
+        #   4. TRAIL_TP    — deja correr el ganador; cierra al retroceder desde el
+        #                    máximo (el TP fijo capó ganadores que iban a 1.0).
+        #   5. TAKE_PROFIT — TP fijo legacy (0 = desactivado).
+        #   6. TIME_EXIT   — supera MAX_HOLD_HOURS.
         now = datetime.now(timezone.utc)
         for pos in list(self.state["open"]):
             mid = midpoint(pos["token_id"])
             if mid is None:
                 continue
+            entry = pos["entry_price"]
 
-            reason = self.check_sl_tp(pos["entry_price"], mid)
-            if not reason and (mid >= RESOLVED_HI or mid <= RESOLVED_LO):
-                reason = "RESOLVED"
-            if not reason and config.COPY_EXIT and pos["token_id"] in sells_by_token:
+            # Máximo alcanzado (persistido) para el trailing-TP.
+            peak = max(pos.get("peak_price", entry), mid)
+            if peak != pos.get("peak_price"):
+                pos["peak_price"] = peak
+
+            chg = (mid - entry) / entry if entry > 0 else 0.0
+            reason = None
+            sl = self._stop_loss_pct(pos.get("question", ""))
+            if sl > 0 and entry > 0 and chg <= -sl:
+                reason = "STOP_LOSS"
+            elif config.COPY_EXIT and pos["token_id"] in sells_by_token:
                 reason = "COPY_EXIT"
-            if not reason and config.MAX_HOLD_HOURS > 0:
+            elif mid >= RESOLVED_HI or mid <= RESOLVED_LO:
+                reason = "RESOLVED"
+            elif (config.TRAILING_TP_PCT > 0 and entry > 0 and peak > 0
+                  and (peak - entry) / entry >= config.TRAILING_TP_ARM
+                  and (peak - mid) / peak >= config.TRAILING_TP_PCT):
+                reason = "TRAIL_TP"
+            elif config.TAKE_PROFIT_PCT > 0 and entry > 0 and chg >= config.TAKE_PROFIT_PCT:
+                reason = "TAKE_PROFIT"
+            elif config.MAX_HOLD_HOURS > 0:
                 opened = datetime.strptime(pos["opened_at"], "%Y-%m-%d %H:%M:%S").replace(
                     tzinfo=timezone.utc
                 )
@@ -507,9 +547,47 @@ class CopyTrader:
             if reason:
                 self.exit_position(pos, mid, reason)
 
+    def _process_force_close(self) -> None:
+        """Cierra en real las posiciones abiertas que pida data/force_close.json
+        (por id o por source_wallet), con reason MANUAL_CLOSE. Lo ejecuta el
+        propio trader (único escritor de positions.json) para evitar carreras de
+        escritura. Borra el fichero solo cuando ya no queda ninguna coincidencia
+        abierta (si una venta falla de forma transitoria, se reintenta el próximo
+        ciclo)."""
+        if not os.path.isfile(FORCE_CLOSE_FILE):
+            return
+        try:
+            with open(FORCE_CLOSE_FILE, encoding="utf-8") as f:
+                req = json.load(f)
+        except Exception as e:
+            print(f"  ✗ force_close.json ilegible: {e}; lo elimino")
+            try:
+                os.remove(FORCE_CLOSE_FILE)
+            except OSError:
+                pass
+            return
+
+        ids = set(req.get("ids") or [])
+        wallets = {str(w).lower() for w in (req.get("wallets") or [])}
+
+        def matches(p: dict) -> bool:
+            return p.get("id") in ids or (p.get("source_wallet") or "").lower() in wallets
+
+        for pos in [p for p in self.state["open"] if matches(p)]:
+            mid = midpoint(pos["token_id"]) or pos["entry_price"]
+            print(f"  ✋ MANUAL_CLOSE: {pos['question'][:50]} @ {mid:.3f}")
+            self.exit_position(pos, mid, "MANUAL_CLOSE")
+
+        if not any(matches(p) for p in self.state["open"]):
+            try:
+                os.remove(FORCE_CLOSE_FILE)
+            except OSError:
+                pass
+
     # ── ciclo principal ──
 
     def cycle(self) -> None:
+        self._process_force_close()
         self.maybe_refresh_wallets()
         wallets = followed_wallets()
         if not wallets:

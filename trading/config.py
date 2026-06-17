@@ -67,6 +67,30 @@ TRADE_SIZE_PCT = float(os.environ.get("TRADE_SIZE_PCT", "0.0"))
 STOP_LOSS_PCT = float(os.environ.get("STOP_LOSS_PCT", "0.0"))
 TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "0.0"))
 
+# SL más ancho para mercados de ALTA VARIANZA intra-evento (spreads/hándicaps
+# deportivos): oscilan mucho durante el partido, así que un SL tirante saca en
+# ruido normal justo antes de que reviertan y resuelvan a favor. Validado con el
+# histórico LIVE: los 2 ÚNICOS SL que cortaron ganadores fueron "Spread (-1.5)"
+# (entrada 0.40 → cortados a 0.21/0.31 → resolvieron a 1.0; el wallet copiado
+# aguantó el bache y vendió a 0.83/0.88). Si el título/slug contiene uno de
+# estos patrones (substring, lower-case) se aplica WIDE_STOP_LOSS_PCT en vez de
+# STOP_LOSS_PCT. WIDE_STOP_LOSS_PCT=0 → desactiva la distinción (SL único).
+WIDE_SL_PATTERNS = [
+    p.strip().lower()
+    for p in os.environ.get("WIDE_SL_PATTERNS", "spread,handicap").split(",")
+    if p.strip()
+]
+WIDE_STOP_LOSS_PCT = float(os.environ.get("WIDE_STOP_LOSS_PCT", "0.0"))
+
+# Take-profit DINÁMICO (trailing): en vez de cerrar a un % fijo (que en LIVE
+# capó a ~0.7-0.8 a 3 ganadores que resolvieron a 1.0, dejando ~+$5 en la mesa),
+# deja correr el ganador y cierra solo si retrocede TRAILING_TP_PCT desde su
+# máximo. Se "arma" únicamente tras subir TRAILING_TP_ARM desde la entrada (no
+# cerrar por ruido al principio). Persiste el máximo en la posición (peak_price).
+# 0 = desactivado (usa el TAKE_PROFIT_PCT fijo si está puesto).
+TRAILING_TP_PCT = float(os.environ.get("TRAILING_TP_PCT", "0.0"))
+TRAILING_TP_ARM = float(os.environ.get("TRAILING_TP_ARM", "0.25"))
+
 # ── Estrategia copy-trading (trading/strategy.py) ───────────────────────────
 # Wallets a seguir, separadas por comas. Si está vacío se leen las top
 # COPY_TOP_N de processed/top_wallets.csv (generado por wallet_analyzer).
