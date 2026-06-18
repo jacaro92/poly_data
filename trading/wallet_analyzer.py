@@ -20,8 +20,40 @@ import polars as pl
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from trading import config
+
 TRADES_DIR = os.path.join("processed", "trades")
 OUTPUT_CSV = os.path.join("processed", "top_wallets.csv")
+MARKETS_CSV = os.path.join("data", "markets.csv")
+
+
+def _excluded_market_ids() -> set[str]:
+    """IDs de mercados degenerados (EXCLUDE_MARKET_PATTERNS, p.ej. cripto
+    'Up or Down') para NO puntuar a las wallets por su rendimiento ahí.
+
+    Sin esto el ranking lo dominan los scalpers de velas cripto y de in-play:
+    cierran muchos lotes rápido con win_rate altísimo → score top, pero operan
+    justo los mercados que la estrategia excluye o que no son copiables con
+    retraso → seguimos wallets cuyos trades nunca copiamos (cartera muerta).
+
+    Scan perezoso de markets.csv (solo id+question+slug, streaming) → bajo RAM.
+    Fail-open: si markets.csv no existe o falla, devuelve set vacío (no romper
+    el ranking por un fallo de lectura)."""
+    pats = config.EXCLUDE_MARKET_PATTERNS
+    if not pats or not os.path.isfile(MARKETS_CSV):
+        return set()
+    try:
+        lz = pl.scan_csv(MARKETS_CSV, infer_schema_length=0).select(["id", "question", "slug"])
+        expr = None
+        for p in pats:
+            e = (pl.col("question").str.to_lowercase().str.contains(p, literal=True)
+                 | pl.col("slug").str.to_lowercase().str.contains(p, literal=True))
+            expr = e if expr is None else (expr | e)
+        ids = lz.filter(expr).select("id").collect(streaming=True)["id"].to_list()
+        return set(ids)
+    except Exception as e:
+        print(f"  ⚠ no se pudieron excluir mercados degenerados del ranking: {e}")
+        return set()
 
 
 def _aggregate_actions(lazy: pl.LazyFrame) -> pl.DataFrame:
@@ -157,6 +189,13 @@ def analyze(min_trades: int = 10, min_volume: float = 100.0) -> pl.DataFrame:
 
     lazy = pl.scan_parquet(trade_files)
 
+    # Excluir del scoring los mercados degenerados (updown, etc.): el ranking
+    # debe reflejar SOLO el rendimiento en mercados que de verdad copiamos.
+    excl = _excluded_market_ids()
+    if excl:
+        lazy = lazy.filter(~pl.col("market_id").is_in(list(excl)))
+        print(f"  Excluyendo {len(excl):,} mercados degenerados del ranking (EXCLUDE_MARKET_PATTERNS)")
+
     print("  Agregando acciones por (wallet, mercado, dirección)…")
     agg = _aggregate_actions(lazy)
     print(f"  {len(agg):,} grupos únicos")
@@ -169,6 +208,11 @@ def analyze(min_trades: int = 10, min_volume: float = 100.0) -> pl.DataFrame:
     min_lots = int(os.environ.get("MIN_WALLET_LOTS", "10"))
     max_trades = int(os.environ.get("MAX_WALLET_TRADES", "20000"))
     max_win_rate = float(os.environ.get("MAX_WALLET_WIN_RATE", "0.99"))
+    # Tamaño medio de apuesta (volume_buy/closed_lots): excluye micro-scalpers
+    # (p.ej. sharps de tenis in-play que apuestan $0.2-1.5/lote con 97% win y
+    # 200% ROI): su edge no se hereda copiando con $2.5/trade y suele ser in-play
+    # (al copiar con retraso el punto ya está decidido). 0 = sin filtro.
+    min_avg_lot = float(os.environ.get("MIN_AVG_LOT_USD", "0"))
 
     # Ranking por ÉXITO, no por P&L bruto. El P&L realizado absoluto favorece a
     # wallets de mucho volumen (pueden ganar $1000 con ROI 1% y win_rate 50%);
@@ -183,6 +227,7 @@ def analyze(min_trades: int = 10, min_volume: float = 100.0) -> pl.DataFrame:
         .with_columns([
             (pl.col("realized_pnl") / pl.col("volume_buy")).alias("roi"),
             (pl.col("wins") / pl.col("closed_lots")).alias("win_rate"),
+            (pl.col("volume_buy") / pl.col("closed_lots")).alias("avg_lot"),
         ])
         .filter(
             (pl.col("n_trades") >= min_trades)
@@ -190,6 +235,7 @@ def analyze(min_trades: int = 10, min_volume: float = 100.0) -> pl.DataFrame:
             & (pl.col("closed_lots") >= min_lots)       # track record real
             & (pl.col("n_trades") <= max_trades)        # excluye MM/HFT
             & (pl.col("win_rate") <= max_win_rate)      # excluye arb perfecto
+            & (pl.col("avg_lot") >= min_avg_lot)        # excluye micro-scalpers
         )
         .with_columns([
             (pl.col("roi") * pl.col("win_rate")
@@ -200,18 +246,19 @@ def analyze(min_trades: int = 10, min_volume: float = 100.0) -> pl.DataFrame:
             pl.col("volume_buy").round(2),
             pl.col("roi").round(4),
             pl.col("win_rate").round(4),
+            pl.col("avg_lot").round(2),
             pl.col("score").round(4),
         ])
         .sort("score", descending=True)
         .select([
-            "wallet", "score", "roi", "win_rate",
+            "wallet", "score", "roi", "win_rate", "avg_lot",
             "realized_pnl", "closed_lots", "n_trades", "volume_buy",
         ])
     )
     print(
         f"  Filtro wallets: lots>={min_lots}, trades<={max_trades}, "
-        f"win_rate<={max_win_rate} → {len(ranking)} copiables "
-        f"(ordenados por score = roi×win_rate×log1p(lots))"
+        f"win_rate<={max_win_rate}, avg_lot>=${min_avg_lot:.0f} → {len(ranking)} "
+        f"copiables (ordenados por score = roi×win_rate×log1p(lots))"
     )
 
     if ranking.is_empty():
