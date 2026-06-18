@@ -309,11 +309,17 @@ class CopyTrader:
         return self._balance_cache[1]
 
     def _stop_loss_pct(self, question: str) -> float:
-        """SL aplicable a un mercado. Los de alta varianza (spreads/hándicaps,
-        WIDE_SL_PATTERNS) usan WIDE_STOP_LOSS_PCT si está configurado; el resto,
-        STOP_LOSS_PCT."""
+        """SL aplicable a un mercado, por categoría:
+          - NO_SL_PATTERNS (deportes in-play): 0 → SL fijo DESACTIVADO. El precio
+            decae con el tiempo por construcción; el SL desde la entrada cortaría
+            justo antes de la resolución. Salida vía COPY_EXIT + RESOLVED + TIME.
+          - WIDE_SL_PATTERNS (spreads/hándicaps): WIDE_STOP_LOSS_PCT (más ancho).
+          - resto: STOP_LOSS_PCT.
+        NO_SL tiene prioridad sobre WIDE."""
+        hay = (question or "").lower()
+        if config.NO_SL_PATTERNS and any(p in hay for p in config.NO_SL_PATTERNS):
+            return 0.0
         if config.WIDE_STOP_LOSS_PCT > 0 and config.WIDE_SL_PATTERNS:
-            hay = (question or "").lower()
             if any(p in hay for p in config.WIDE_SL_PATTERNS):
                 return config.WIDE_STOP_LOSS_PCT
         return config.STOP_LOSS_PCT

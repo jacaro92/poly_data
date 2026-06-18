@@ -82,6 +82,24 @@ WIDE_SL_PATTERNS = [
 ]
 WIDE_STOP_LOSS_PCT = float(os.environ.get("WIDE_STOP_LOSS_PCT", "0.0"))
 
+# SIN SL fijo: mercados deportivos in-play donde el precio DECAE con el tiempo
+# por construcción (un Over que aún no entra, un "X gana" mientras va 0-0…)
+# aunque la apuesta sea sólida: el fútbol resuelve tarde (goles/triunfos al
+# final). Un SL medido desde la entrada confunde esa decadencia temporal normal
+# con una pérdida real y corta justo antes de la resolución. Para estos la
+# salida se apoya en COPY_EXIT (si la smart money se sale, salimos) + RESOLVED
+# (dejar que resuelva) + TIME_EXIT, NO en un % fijo. Tiene PRIORIDAD sobre
+# WIDE_SL_PATTERNS. Vacío = no desactivar el SL en ningún mercado.
+NO_SL_PATTERNS = [
+    p.strip().lower()
+    for p in os.environ.get(
+        "NO_SL_PATTERNS",
+        "vs.,win on,o/u,both teams,total goals,total corners,exact score,"
+        "to score,draw,1st half,2nd half,moneyline,spread,handicap",
+    ).split(",")
+    if p.strip()
+]
+
 # Take-profit DINÁMICO (trailing): en vez de cerrar a un % fijo (que en LIVE
 # capó a ~0.7-0.8 a 3 ganadores que resolvieron a 1.0, dejando ~+$5 en la mesa),
 # deja correr el ganador y cierra solo si retrocede TRAILING_TP_PCT desde su
