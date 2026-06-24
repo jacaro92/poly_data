@@ -191,6 +191,13 @@ MAX_POS_PER_EVENT = int(os.environ.get("MAX_POS_PER_EVENT", "2"))
 COPY_EXIT = os.environ.get("COPY_EXIT", "true").lower() == "true"
 MAX_HOLD_HOURS = float(os.environ.get("MAX_HOLD_HOURS", "72"))
 
+# Hold mínimo (segundos) antes de permitir un COPY_EXIT. Anti-churn: los wallets
+# scalpean (compran y venden en segundos); sin esto copiábamos su entrada y su
+# salida casi seguidas, pagando el spread dos veces por nada (round-trips de ~4s
+# vistos en LIVE). RESOLVED no se ve afectado (puede cerrar antes si el mercado
+# se decide). 0 = sin límite.
+MIN_COPY_HOLD_SECONDS = float(os.environ.get("MIN_COPY_HOLD_SECONDS", "120"))
+
 # ── Filtro de ventana de resolución del mercado (entrada) ───────────────────
 # Solo copiar mercados que RESUELVEN pronto (end_date_iso dentro de esta
 # ventana desde ahora). Distinto de MAX_HOLD_HOURS (que limita cuánto aguanta

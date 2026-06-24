@@ -536,11 +536,19 @@ class CopyTrader:
                 pos["peak_price"] = peak
 
             chg = (mid - entry) / entry if entry > 0 else 0.0
+            try:
+                opened_ts = datetime.strptime(pos["opened_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                held_s = (now - opened_ts).total_seconds()
+            except Exception:
+                held_s = 1e9
             reason = None
             sl = self._stop_loss_pct(pos.get("question", ""))
             if sl > 0 and entry > 0 and chg <= -sl:
                 reason = "STOP_LOSS"
-            elif config.COPY_EXIT and pos["token_id"] in sells_by_token:
+            elif (config.COPY_EXIT and pos["token_id"] in sells_by_token
+                  and held_s >= config.MIN_COPY_HOLD_SECONDS):
+                # Hold mínimo: no seguir un COPY_EXIT inmediato (scalp del wallet)
+                # que solo pagaría el spread. RESOLVED sí puede cerrar antes.
                 reason = "COPY_EXIT"
             elif mid >= RESOLVED_HI or mid <= RESOLVED_LO:
                 reason = "RESOLVED"
@@ -633,9 +641,20 @@ class CopyTrader:
                 (t for t in trades if int(t.get("timestamp", 0)) > cursor),
                 key=lambda t: int(t.get("timestamp", 0)),
             )
+            # Anti-churn: si el wallet COMPRÓ y VENDIÓ el mismo token dentro del
+            # mismo lote (scalp de segundos), ya está plano → no copiar la entrada
+            # (si no, abriríamos y cerraríamos en el mismo ciclo pagando el spread
+            # dos veces, los round-trips de ~4s que se vieron en LIVE).
+            sold_in_batch = {
+                str(t.get("asset", "")) for t in new
+                if (t.get("side") or "").upper() == "SELL"
+            }
             for t in new:
                 side = (t.get("side") or "").upper()
                 if side == "BUY":
+                    if str(t.get("asset", "")) in sold_in_batch:
+                        print(f"  ⏭ {(t.get('title') or '')[:50]} — wallet ya cerró (scalp); no copio")
+                        continue
                     self.maybe_enter(t, wallet)
                 elif side == "SELL":
                     sells_by_token[str(t.get("asset", ""))] = wallet
