@@ -339,6 +339,8 @@ class CopyTrader:
         bad = next((p for p in config.EXCLUDE_MARKET_PATTERNS if p in hay), None)
         if bad:
             skip = f"tipo de mercado excluido ('{bad}')"
+        elif config.ONLY_MARKET_PATTERNS and not any(p in hay for p in config.ONLY_MARKET_PATTERNS):
+            skip = "fuera de whitelist (ONLY_MARKET_PATTERNS)"
         elif usd < config.MIN_COPY_TRADE_USD:
             skip = f"trade ${usd:.0f} < umbral ${config.MIN_COPY_TRADE_USD:.0f}"
         elif not (config.ENTRY_PRICE_MIN <= price <= config.ENTRY_PRICE_MAX):
@@ -375,9 +377,11 @@ class CopyTrader:
                             f"{config.MAX_RESOLUTION_HOURS:.0f}h (ventana larga)"
                         )
 
+        bid = ask = None
         if not skip:
             entry = midpoint(token_id) or price
             size_usd = config.compute_size(self.balance())
+            bid, ask = best_bid_ask(token_id)
             if not (config.ENTRY_PRICE_MIN <= entry <= config.ENTRY_PRICE_MAX):
                 skip = f"entrada {entry:.3f} fuera de [{config.ENTRY_PRICE_MIN}, {config.ENTRY_PRICE_MAX}]"
             elif config.AUTO_EXECUTE and self.balance() < size_usd:
@@ -385,13 +389,16 @@ class CopyTrader:
             elif config.MAX_SPREAD_PCT > 0:
                 # Mercado ilíquido = spread ancho: se paga el peaje al cruzar el
                 # libro al entrar (ask) y salir (bid). Sin libro = inservible.
-                bid, ask = best_bid_ask(token_id)
                 if not bid or not ask:
                     skip = "mercado sin libro (ilíquido)"
                 else:
                     rel = (ask - bid) / ((ask + bid) / 2.0)
                     if rel > config.MAX_SPREAD_PCT:
                         skip = f"spread {rel:.0%} > {config.MAX_SPREAD_PCT:.0%} (ilíquido)"
+            # SIM honesto: en paper se compra al ASK (cruzando el libro), no al
+            # midpoint, para que el P&L del SIM incluya el coste del spread.
+            if not skip and not self.executor and config.SIM_REALISTIC_FILLS and ask:
+                entry = ask
 
         positions.log_signal(
             self.state,
@@ -551,7 +558,15 @@ class CopyTrader:
                     reason = "TIME_EXIT"
 
             if reason:
-                self.exit_position(pos, mid, reason)
+                exec_price = mid
+                # SIM honesto: salir al BID (cruzando el libro), no al midpoint,
+                # salvo RESOLVED (se redime on-chain a 0/1, no se vende al libro).
+                if (not self.executor and config.SIM_REALISTIC_FILLS
+                        and reason != "RESOLVED"):
+                    sbid, _ = best_bid_ask(pos["token_id"])
+                    if sbid:
+                        exec_price = sbid
+                self.exit_position(pos, exec_price, reason)
 
     def _process_force_close(self) -> None:
         """Cierra en real las posiciones abiertas que pida data/force_close.json

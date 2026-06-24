@@ -41,6 +41,13 @@ SIGNATURE_TYPE = int(os.environ.get("SIGNATURE_TYPE", "3"))
 # Gate de ejecución real. false => solo lectura/simulación.
 AUTO_EXECUTE = os.environ.get("AUTO_EXECUTE", "false").lower() == "true"
 
+# SIM con ejecución REALISTA: en paper (AUTO_EXECUTE=false), entrar al ASK y
+# salir al BID (cruzando el libro) en vez de al midpoint. El midpoint NUNCA paga
+# el spread → el SIM sobreestima el P&L y oculta justo el coste que hundió el
+# LIVE. Con esto el SIM mide el edge NETO de spread (la pregunta real: ¿sobrevive
+# el edge direccional al coste de ejecución?). No afecta a LIVE (usa fills reales).
+SIM_REALISTIC_FILLS = os.environ.get("SIM_REALISTIC_FILLS", "true").lower() == "true"
+
 # Capital al pasar a LIVE. Sirve para el P&L REAL de cuenta del dashboard:
 # pnl_total = (caja + valor de posiciones abiertas) - INITIAL_CAPITAL_USD.
 # Esta métrica cruza con la "Cartera" de Polymarket (mark-to-market), a
@@ -132,6 +139,16 @@ MIN_COPY_TRADE_USD = float(os.environ.get("MIN_COPY_TRADE_USD", "50.0"))
 EXCLUDE_MARKET_PATTERNS = [
     p.strip().lower()
     for p in os.environ.get("EXCLUDE_MARKET_PATTERNS", "updown,up or down").split(",")
+    if p.strip()
+]
+
+# WHITELIST: si NO está vacía, SOLO se copian mercados cuyo título/slug contenga
+# uno de estos patrones (substring, lower-case). Vacía = sin restricción. Se usa
+# para concentrar la estrategia donde está el edge validado (deportes): el SIM
+# limpio (jun 19-24) dio deporte +$18.74 (58% win) vs política/cripto ~breakeven.
+ONLY_MARKET_PATTERNS = [
+    p.strip().lower()
+    for p in os.environ.get("ONLY_MARKET_PATTERNS", "").split(",")
     if p.strip()
 ]
 
